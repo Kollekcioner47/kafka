@@ -1,0 +1,334 @@
+Лабораторная 2.1: Работа с Admin API Kafka
+
+Цель: Освоить основные операции управления Kafka через Admin API
+Время выполнения: 20-30 минут
+Необходимо: Рабочий кластер Kafka из Лабораторной 1
+
+# ============================================
+# 1. ПОДГОТОВКА
+# ============================================
+
+# Подключитесь к kafka1.lab
+ssh kafka1.lab
+
+# Проверьте, что кластер работает
+sudo systemctl status kafka
+
+# Убедитесь, что можем подключиться к Kafka
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+# Ожидаемый вывод: список всех брокеров и их версий API
+
+
+# ============================================
+# 2. ОСНОВНЫЕ ОПЕРАЦИИ С ТОПИКАМИ
+# ============================================
+
+# 2.1. Создание топика с явными параметрами
+echo "Создаем топик 'orders' с 3 партициями, RF=3, retention 7 дней"
+sudo /opt/kafka/bin/kafka-topics.sh --create \
+  --topic orders \
+  --bootstrap-server localhost:9092 \
+  --partitions 3 \
+  --replication-factor 3 \
+  --config retention.ms=604800000 \
+  --config cleanup.policy=delete
+
+# 2.2. Создаем compacted топик для данных по ключу (например, для кеша)
+echo "Создаем compacted топик 'user-profiles' для хранения последнего состояния по ключу"
+sudo /opt/kafka/bin/kafka-topics.sh --create \
+  --topic user-profiles \
+  --bootstrap-server localhost:9092 \
+  --partitions 6 \
+  --replication-factor 3 \
+  --config cleanup.policy=compact \
+  --config delete.retention.ms=86400000 \
+  --config segment.ms=3600000
+
+# 2.3. Список всех топиков (включая системные)
+echo "Список всех топиков в кластере:"
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+
+# 2.4. Детальная информация о топике
+echo "Детальная информация о топике 'orders':"
+/opt/kafka/bin/kafka-topics.sh --describe \
+  --topic orders \
+  --bootstrap-server localhost:9092
+# Ожидаемо: вывод показывает партиции, лидеров, реплики, ISR
+
+
+# ============================================
+# 3. ИЗМЕНЕНИЕ КОНФИГУРАЦИИ ТОПИКОВ
+# ============================================
+
+# 3.1. Увеличиваем количество партиций (НЕЛЬЗЯ уменьшать!)
+echo "Увеличиваем количество партиций в топике 'orders' с 3 до 6"
+sudo /opt/kafka/bin/kafka-topics.sh --alter \
+  --topic orders \
+  --bootstrap-server localhost:9092 \
+  --partitions 6
+
+# Проверяем изменение
+/opt/kafka/bin/kafka-topics.sh --describe --topic orders --bootstrap-server localhost:9092
+
+# 3.2. Изменяем конфигурацию топика
+echo "Изменяем retention policy для топика 'orders' на 14 дней"
+sudo /opt/kafka/bin/kafka-configs.sh --alter \
+  --entity-type topics \
+  --entity-name orders \
+  --bootstrap-server localhost:9092 \
+  --add-config retention.ms=1209600000
+
+# 3.3. Просмотр текущей конфигурации топика
+echo "Текущая конфигурация топика 'orders':"
+/opt/kafka/bin/kafka-configs.sh --describe \
+  --entity-type topics \
+  --entity-name orders \
+  --bootstrap-server localhost:9092
+
+Команда запрашивает эффективную конфигурацию топика orders, а именно:
+динамические (переопределённые) параметры;
+откуда именно взялось значение каждого параметра;
+какие дефолты применяются.
+Важно:
+выводятся не все возможные настройки, а только те, которые отличаются от значений по умолчанию или были явно заданы.
+cleanup.policy=delete
+Для топика включена политика удаления сообщений.
+Сообщения удаляются по времени (retention.ms) или по размеру (retention.bytes).
+Альтернатива:
+compact — лог-компакция по ключу
+delete,compact — комбинированный режим
+sensitive=false
+Параметр не содержит чувствительных данных.
+Kafka может отображать его значение в открытом виде.
+synonyms показывает источник значения и приоритеты:
+DYNAMIC_TOPIC_CONFIG
+→ значение явно задано для топика orders
+DEFAULT_CONFIG
+→ дефолтное значение брокера (log.cleanup.policy)
+значение совпадает с дефолтом,
+но всё равно зафиксировано на уровне топика.
+retention.ms=1209600000
+Время хранения сообщений:
+1 209 600 000 мс = 14 дней
+После этого:
+сегменты лога с устаревшими сообщениями будут удалены.
+
+
+# 3.4. Добавляем несколько конфигураций одновременно
+echo "Добавляем несколько параметров для топика 'user-profiles':"
+sudo /opt/kafka/bin/kafka-configs.sh --alter \
+  --entity-type topics \
+  --entity-name user-profiles \
+  --bootstrap-server localhost:9092 \
+  --add-config max.message.bytes=1048576,segment.bytes=1073741824
+
+
+# ============================================
+# 4. УПРАВЛЕНИЕ КЛАСТЕРОМ
+# ============================================
+
+# 4.1. Просмотр метаданных кластера (расширенная информация)
+echo "Метаданные кластера:"
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status
+
+# 4.2. Просмотр всех брокеров
+echo "Список брокеров в кластере:"
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 | grep "kafka1.lab:9092"
+
+# 4.3. Получение Cluster ID
+echo "Получаем ID кластера:"
+/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server localhost:9092
+
+# 4.4. Проверка кворума контроллеров (KRaft)
+echo "Статус кворума контроллеров:"
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --replication
+
+
+# ============================================
+# 5. УПРАВЛЕНИЕ ПОТРЕБИТЕЛЯМИ (Consumer Groups)
+# ============================================
+
+# 5.1. Создаем тестового потребителя в фоне
+echo "Запускаем тестового потребителя в фоне..."
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic orders \
+  --bootstrap-server localhost:9092 \
+  --group test-group-1 \
+  --timeout-ms 5000 &
+CONSUMER_PID=$!
+
+# Ждем 2 секунды
+sleep 2
+
+# 5.2. Просмотр consumer groups
+echo "Список consumer groups:"
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --list
+
+# 5.3. Детальная информация о consumer group
+echo "Детальная информация о группе 'test-group-1':"
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group test-group-1
+# Ожидаемо: увидим LAG, текущий offset, partition assignment
+
+# 5.4. Останавливаем тестового потребителя
+kill $CONSUMER_PID 2>/dev/null
+
+
+# ============================================
+# 6. МОНИТОРИНГ И ДИАГНОСТИКА
+# ============================================
+
+# 6.1. Проверка размера топика на диске
+echo "Размер топиков на диске:"
+sudo du -sh /opt/kafka/data/*orders* /opt/kafka/data/*user-profiles* 2>/dev/null | head -5
+
+# 6.2. Просмотр самых больших партиций
+echo "5 самых больших партиций в кластере:"
+find /opt/kafka/data -name "*.log" -exec du -h {} + 2>/dev/null | sort -rh | head -5
+
+# 6.3. Проверка доступности топиков через метаданные
+echo "Проверяем доступность топиков через метаданные:"
+/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server localhost:9092
+
+
+# ============================================
+# 7. ПРОДВИНУТЫЕ ОПЕРАЦИИ
+# ============================================
+
+# 7.1. Удаление топика (ОСТОРОЖНО!)
+echo "Удаляем тестовый топик 'orders' (требует настройки delete.topic.enable=true)"
+# Сначала проверяем, есть ли топик
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep orders
+
+# Если хотите удалить (раскомментируйте):
+sudo /opt/kafka/bin/kafka-topics.sh --delete \
+  --topic orders \
+  --bootstrap-server localhost:9092
+
+# 7.2. Создание топика с сегментами по 100MB
+echo "Создаем топик с настроенным размером сегментов:"
+sudo /opt/kafka/bin/kafka-topics.sh --create \
+  --topic logs-application \
+  --bootstrap-server localhost:9092 \
+  --partitions 3 \
+  --replication-factor 3 \
+  --config segment.bytes=104857600 \
+  --config segment.ms=3600000 \
+  --config retention.bytes=10737418240
+
+# 7.3. Изменение нескольких топиков одновременно через файл
+echo "Создаем конфигурационный файл для изменения нескольких топиков:"
+cat > /tmp/topic-updates.txt << EOF
+orders:partitions=6
+user-profiles:partitions=8
+logs-application:partitions=4
+EOF
+
+# Для выполнения (раскомментируйте):
+# while IFS=':' read -r topic config; do
+#   sudo /opt/kafka/bin/kafka-topics.sh --alter \
+#     --topic "$topic" \
+#     --bootstrap-server localhost:9092 \
+#     --partitions $(echo $config | cut -d'=' -f2)
+# done < /tmp/topic-updates.txt
+
+
+# ============================================
+# 8. ПРОВЕРКА РЕЗУЛЬТАТОВ
+# ============================================
+
+echo "=== ИТОГОВАЯ ПРОВЕРКА ==="
+
+# 8.1. Сводная информация по всем топикам
+echo "1. Сводка по топикам:"
+/opt/kafka/bin/kafka-topics.sh --describe \
+  --bootstrap-server localhost:9092 \
+  | grep -E "(Topic:|PartitionCount:|ReplicationFactor:|Configs:)"
+
+# 8.2. Проверка конфигурации
+echo "2. Конфигурация всех топиков:"
+/opt/kafka/bin/kafka-configs.sh --describe \
+  --bootstrap-server localhost:9092 \
+  --entity-type topics \
+  | head -20
+
+# 8.3. Проверка потребителей
+echo "3. Consumer groups (если есть):"
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --list \
+  | wc -l | xargs echo "Количество consumer groups:"
+
+# 8.4. Статус кластера
+echo "4. Статус кластера:"
+/opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server localhost:9092 \
+  | grep -c "9092" | xargs echo "Количество доступных брокеров:"
+
+
+# ============================================
+# 9. ОЧИСТКА (ОПЦИОНАЛЬНО)
+# ============================================
+
+# Удаление тестовых топиков (если нужно)
+# echo "Очистка тестовых топиков..."
+# for topic in orders user-profiles logs-application; do
+#   /opt/kafka/bin/kafka-topics.sh --delete \
+#     --topic $topic \
+#     --bootstrap-server localhost:9092 2>/dev/null && \
+#     echo "Удален топик: $topic" || \
+#     echo "Топик $topic не найден или не может быть удален"
+# done
+
+
+# ============================================
+# 10. ТЕОРИЯ ДЛЯ ЗАПОМИНАНИЯ
+# ============================================
+
+echo "
+=== КЛЮЧЕВЫЕ ПРИНЦИПЫ РАБОТЫ С ADMIN API ===
+
+1. Топики:
+   - Можно создавать, удалять, изменять
+   - НЕЛЬЗЯ уменьшать количество партиций
+   - Retention работает по времени ИЛИ размеру
+
+2. Партиции:
+   - Определяют параллелизм обработки
+   - Сообщения с одинаковым ключом → одна партиция
+   - Больше партиций = больше параллелизма, но сложнее управления
+
+3. Конфигурация:
+   - Может быть задана при создании топика
+   - Можно изменять динамически
+   - Важные параметры: retention, cleanup.policy, compression.type
+
+4. Consumer Groups:
+   - Автоматически создаются при первом подключении
+   - Offset хранится во внутреннем топике __consumer_offsets
+   - Можно просматривать lag (отставание)
+
+5. Безопасность:
+   - Удаление топиков требует отдельной настройки
+   - Изменения в production всегда через процесс Change Management
+"
+
+echo "=== ЛАБОРАТОРНАЯ 2.1 ЗАВЕРШЕНА ==="
+echo "Вы освоили основные операции Admin API Kafka!"
+echo "Следующий шаг: работа с продюсерами и консюмерами (Лаба 2.2)"
+
+Почему нельзя уменьшать партиции?
+Потому что данные уже распределены по партициям
+Уменьшение привело бы к потере данных или необходимости ребалансировки
+Лучше изначально закладывать с запасом или создавать новый топик
+Cleanup policy: delete vs compact:
+delete - удаляет старые сообщения по времени/размеру (логи, события)
+compact - оставляет последнее сообщение для каждого ключа (состояния, кэши)
+Segment settings:
+segment.bytes - размер сегмента на диске
+segment.ms - время жизни сегмента
+Маленькие сегменты → быстрее compaction, но больше файлов

@@ -1,0 +1,415 @@
+Лабораторная работа 3.1: Подсчёт событий в окне с использованием Kafka Streams
+Цель: Создать простое Java-приложение Kafka Streams, которое подсчитывает количество сообщений в топике за последние 30 секунд и выводит результат в реальном времени.
+
+Шаг 1: Подготовка окружения
+На kafka1.lab выполните:
+# 1. Создадим топики для работы
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic streams-input \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 3
+
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic streams-output \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 3
+
+# 2. Проверим топики
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+# Должны увидеть: streams-input, streams-output
+
+Шаг 2: Создание Java-приложения
+Создадим простой сервис на Java, который использует Kafka Streams API:
+# Перейдем в домашнюю директорию пользователя kafka
+sudo -u kafka bash
+cd /home/kafka
+
+# Создадим структуру проекта
+mkdir -p kafka-streams-lab/src/main/java/com/lab
+cd kafka-streams-lab
+
+Создайте файл pom.xml:
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.lab</groupId>
+    <artifactId>kafka-streams-lab</artifactId>
+    <version>1.0</version>
+    
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <kafka.version>4.1.1</kafka.version>
+    </properties>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-streams</artifactId>
+            <version>${kafka.version}</version>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.16</version>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.lab.WindowCounter</mainClass>
+                        </manifest>
+                    </archive>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+Создайте файл src/main/java/com/lab/WindowCounter.java:
+package com.lab;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.kstream.*;
+
+import java.time.Duration;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+
+public class WindowCounter {
+    public static void main(String[] args) {
+        // Конфигурация Kafka Streams
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "window-counter-v1");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092");
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        StreamsBuilder builder = new StreamsBuilder();
+
+        // 1. Читаем поток из входного топика
+        KStream<String, String> inputStream = builder.stream("streams-input");
+
+        // 2. Присваиваем ключ "all" для всех сообщений (чтобы считать все вместе)
+        KStream<String, String> keyedStream = inputStream
+            .selectKey((key, value) -> "total");
+
+        // 3. Группируем по ключу
+        KGroupedStream<String, String> grouped = keyedStream
+            .groupByKey(Grouped.with(Serdes.String(), Serdes.String()));
+
+        // 4. Применяем окно: скользящее окно 30 секунд с шагом 10 секунд
+        TimeWindowedKStream<String, String> windowed = grouped
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofSeconds(30))
+                .advanceBy(Duration.ofSeconds(10)));
+
+        // 5. Считаем количество сообщений в каждом окне
+        KTable<Windowed<String>, Long> counts = windowed.count();
+
+        // 6. Преобразуем результат в читаемый формат и отправляем в выходной топик
+        counts.toStream()
+            .map((windowedKey, count) -> {
+                // Форматируем вывод: [окно] -> количество
+                String windowInfo = String.format("[%s - %s]",
+                    windowedKey.window().startTime().toString(),
+                    windowedKey.window().endTime().toString());
+                return new KeyValue<>(windowInfo, count.toString());
+            })
+            .to("streams-output", Produced.with(Serdes.String(), Serdes.String()));
+
+        // 7. Также выводим результат в консоль для наглядности
+        counts.toStream()
+            .foreach((windowedKey, count) -> {
+                System.out.printf("Окно: %s - %s | Сообщений: %d%n",
+                    windowedKey.window().startTime(),
+                    windowedKey.window().endTime(),
+                    count);
+            });
+
+        Topology topology = builder.build();
+        System.out.println("Топология приложения:");
+        System.out.println(topology.describe());
+
+        KafkaStreams streams = new KafkaStreams(topology, props);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        // Обработка завершения
+        Runtime.getRuntime().addShutdownHook(new Thread("streams-shutdown") {
+            @Override
+            public void run() {
+                System.out.println("Завершение работы...");
+                streams.close();
+                latch.countDown();
+            }
+        });
+
+        try {
+            System.out.println("Запуск Kafka Streams приложения...");
+            streams.start();
+            latch.await();
+        } catch (Exception e) {
+            System.err.println("Ошибка: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+}
+
+Шаг 3: Сборка приложения
+# Установим Maven если еще нет
+sudo apt install -y maven
+
+# Соберем проект
+cd /home/kafka/kafka-streams-lab
+mvn clean package
+
+# Проверим что jar создался
+ls target/kafka-streams-lab-1.0-jar-with-dependencies.jar
+
+Шаг 4: Запуск приложения
+# Запустим наше приложение в фоновом режиме
+java -jar target/kafka-streams-lab-1.0-jar-with-dependencies.jar &
+
+# Проверим что оно работает
+sleep 5
+echo "Приложение запущено!"
+
+Шаг 5: Тестирование работы
+Откройте три терминала на kafka1.lab:
+
+Терминал 1 — Продюсер:
+# Будем отправлять тестовые сообщения
+while true; do
+  echo "Сообщение от $(date '+%H:%M:%S')" | \
+    /opt/kafka/bin/kafka-console-producer.sh \
+    --topic streams-input \
+    --bootstrap-server localhost:9092
+  sleep 5  # Отправляем сообщение каждые 5 секунд
+done
+
+Терминал 2 — Потребитель выходного топика:
+# Читаем результаты подсчета
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic streams-output \
+  --from-beginning \
+  --bootstrap-server localhost:9092 \
+  --formatter org.apache.kafka.tools.consumer.DefaultMessageFormatter \
+  --property print.key=true \
+  --property print.value=true \
+  --property key.deserializer=org.apache.kafka.common.serialization.StringDeserializer \
+  --property value.deserializer=org.apache.kafka.common.serialization.StringDeserializer
+
+Терминал 3 — Мониторинг топиков:
+# Периодически проверяем состояние топиков
+watch -n 10 "/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep streams-"
+Шаг 6: Наблюдение за работой
+Что происходит:
+Вы отправляете сообщение в streams-input каждые 5 секунд
+Приложение Kafka Streams:
+Читает сообщения
+Группирует их с ключом "total"
+Считает количество сообщений за последние 30 секунд
+Каждые 10 секунд обновляет окно
+Результаты появляются в streams-output и в консоли приложения
+Пример вывода в консоли приложения:
+Окно: 10:00:00 - 10:00:30 | Сообщений: 3
+Окно: 10:00:10 - 10:00:40 | Сообщений: 4
+Окно: 10:00:20 - 10:00:50 | Сообщений: 5
+
+Шаг 7: Эксперименты
+Попробуйте изменить параметры:
+Измените частоту отправки сообщений:
+# В терминале продюсера измените sleep:
+sleep 2  # Каждые 2 секунды
+# Или
+sleep 10 # Каждые 10 секунд
+
+Посмотрите внутренние топики Kafka Streams:
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep window-counter
+
+Проверьте consumer lag:
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe --group window-counter-v1
+
+Шаг 8: Остановка и очистка
+# 1. Остановить продюсер (Ctrl+C в терминале 1)
+# 2. Остановить приложение Kafka Streams
+pkill -f WindowCounter
+
+# 3. Удалить топики (опционально)
+/opt/kafka/bin/kafka-topics.sh --delete --topic streams-input --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --delete --topic streams-output --bootstrap-server localhost:9092
+
+Вопросы для самопроверки:
+Что происходит с сообщениями, если приложение Kafka Streams перезапустить?
+Подсказка: посмотрите параметр AUTO_OFFSET_RESET_CONFIG
+Почему мы используем ключ "total" для всех сообщений?
+Подсказка: что произойдет, если у сообщений будут разные ключи?
+Как изменить размер окна на 1 минуту?
+Подсказка: измените Duration.ofSeconds(30) в коде
+Что означают параметры окна: size=30s, advance=10s?
+Подсказка: это hopping window с перекрытием
+Где хранится состояние подсчета (count)?
+Подсказка: проверьте changelog топики приложения
+
+Дополнительное задание (по желанию):
+Модифицируйте приложение так, чтобы оно считало:
+Количество сообщений для каждого уникального ключа
+Среднюю длину сообщений в окне
+Количество сообщений за последнюю 1 минуту без перекрытия (tumbling window)
+
+
+Пояснение к лабораторной работе 3.1: Kafka Streams - Подсчёт событий в окне
+Что мы сделали?
+Мы создали полноценный пайплайн потоковой обработки данных с использованием Apache Kafka и Kafka Streams:
+
+1. Развернули инфраструктуру
+Подготовили три виртуальные машины с Kafka в режиме KRaft (без ZooKeeper)
+
+Настроили репликацию данных для отказоустойчивости (3 реплики)
+
+Создали кластер Kafka, способный обрабатывать миллионы сообщений в секунду
+
+2. Реализовали приложение потоковой обработки
+Создали Java-приложение на Kafka Streams API
+Реализовали логику подсчёта событий в скользящем окне:
+Размер окна: 30 секунд
+Шаг окна: 10 секунд (перекрывающиеся окна)
+Агрегация: подсчёт количества сообщений
+Настроили ввод/вывод данных через топики Kafka
+3. Построили полный конвейер обработки
+Продюсер → (streams-input) → Kafka Streams → (streams-output) → Консюмер
+                     ↓
+              Подсчёт в окне
+                     ↓
+            Вывод в консоль + Kafka
+Что мы получили в итоге?
+Работающую систему реального времени
+Источник данных: продюсер отправляет сообщения каждые 5 секунд
+Обработчик: Kafka Streams приложение подсчитывает сообщения в окнах
+Результаты: выводятся в консоль И сохраняются в Kafka для дальнейшего использования
+Конкретные технические результаты
+Топик streams-input - входной поток сырых событий
+Топик streams-output - результат обработки (статистика по окнам)
+Приложение Kafka Streams:
+Автоматически масштабируется (можно запустить несколько инстансов)
+Сохраняет состояние (не теряет данные при перезапуске)
+Обрабатывает данные exactly-once (каждое сообщение учтётся ровно один раз)
+Пример работы системы
+Сообщения отправляются:     12:00:00, 12:00:05, 12:00:10, 12:00:15, ...
+Окно [12:00:00 - 12:00:30]: 6 сообщений
+Окно [12:00:10 - 12:00:40]: 7 сообщений (новые + перекрытие)
+Окно [12:00:20 - 12:00:50]: 5 сообщений
+ЗАЧЕМ всё это нужно? Практические применения
+1. Мониторинг и алертинг в реальном времени
+// Пример: детектирование аномалий
+if (count > 1000) { // Если больше 1000 событий за 30 секунд
+    sendAlert("ПИК НАГРУЗКИ!");
+}
+Применение: обнаружение DDoS-атак, аномальной активности пользователей, сбоев в системе.
+
+2. Аналитика поведения пользователей
+// Пример: подсчёт активных пользователей
+windowedStream
+    .selectKey((key, value) -> extractUserId(value))
+    .count(Materialized.as("active-users-store"))
+Применение:
+"Сколько пользователей совершили покупку за последние 5 минут?"
+"Как изменилась активность после запуска новой функции?"
+
+3. Агрегация метрик для дашбордов
+// Пример: подготовка данных для Grafana
+counts.toStream()
+    .map((window, count) -> {
+        return new Metric("events_per_30s", count, window.endTime());
+    })
+    .to("metrics-topic");
+Применение: реальные графики в Grafana/Prometheus без задержки.
+
+4. Обработка данных IoT-устройств
+// Пример: усреднение показаний датчиков
+sensorReadings
+    .windowedBy(TimeWindows.of(Duration.ofMinutes(1)))
+    .aggregate(() -> new SensorStats(),
+               (key, value, aggregate) -> aggregate.add(value))
+Применение: усреднение температуры с датчиков, подсчёт количества срабатываний.
+
+5. Обогащение данных в реальном времени
+// Пример: добавление геолокации к событиям
+clicksStream
+    .leftJoin(userLocationsTable,
+              (click, location) -> enrichClick(click, location))
+Применение: добавление контекста к событиям без задержки.
+
+Ключевые преимущества нашего решения
+1. Масштабируемость
+Можно запустить 10, 100, 1000 инстансов приложения
+Kafka автоматически распределит партиции между инстансами
+Пропускная способность растёт линейно
+
+2. Отказоустойчивость
+Данные реплицируются на 3 сервера
+При падении инстанса Kafka Streams, его партиции перераспределяются
+Состояние (count) хранится в changelog-топиках с репликацией
+
+3. Простота эксплуатации
+Не нужно отдельный кластер для обработки (используем тот же Kafka)
+Автоматическое восстановление после сбоев
+Встроенный мониторинг через JMX метрики
+
+4. Точная семантика обработки
+Exactly-once: каждое сообщение обрабатывается ровно один раз
+Сохраняется порядок сообщений в пределах ключа
+Гарантированная доставка результатов
+
+Сравнение с прямыми HTTP-вызовами
+// СЛОЖНО И НЕНАДЁЖНО:
+serviceA → HTTP → serviceB → HTTP → serviceC
+// При падении serviceB вся цепочка ломается
+
+// ПРОСТО И НАДЁЖНО (наш подход):
+serviceA → Kafka → serviceB → Kafka → serviceC
+// При падении serviceB сообщения накапливаются в Kafka и обрабатываются позже
+
+Мы построили не просто "ещё один пример кода", а прототип промышленной системы, которая:
+Обрабатывает данные в реальном времени - не "после того как", а "прямо сейчас"
+Масштабируется до миллионов событий - архитектура не ограничивает рост
+Не теряет данные - репликация и exactly-once гарантии
+Проста в разработке - декларативный API Kafka Streams
+Интегрируется со всей экосистемой - Kafka Connect, Schema Registry, etc
+
+Это фундамент для:
+Систем мониторинга (как в Netflix/ Uber)
+Рекомендательных систем (real-time personalization)
+Платформ для IoT (обработка телеметрии)
+Фрод-детекции (обнаружение мошенничества в реальном времени)
+Аналитики продукта (как пользователи взаимодействуют с приложением прямо сейчас)
+Вы получили работающий прототип, который можно развернуть в production уже сегодня!

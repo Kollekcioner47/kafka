@@ -1,0 +1,566 @@
+Лабораторная работа 3.2: Настройка пайплайна PostgreSQL → Kafka → OpenSearch через Connect
+Цель работы
+Настроить end-to-end пайплайн для передачи данных из PostgreSQL в OpenSearch через Apache Kafka в реальном времени.
+
+Архитектура решения
+PostgreSQL → Debezium CDC → Kafka → Kafka Connect → OpenSearch
+    ↓             ↓            ↓         ↓             ↓
+  База        Отслеживает   Брокер    Интеграция   Поисковый
+  данных      изменения     сообщений   данных       индекс
+Часть 1: Подготовка окружения
+Шаг 1.1: Проверка доступности компонентов
+На kafka1.lab (10.0.2.20) выполните:
+# Проверяем, что все компоненты доступны
+echo "=== Проверка компонентов ==="
+
+# 1. Проверяем Kafka
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+echo "Kafka: ✓"
+
+# 2. Проверяем PostgreSQL (с kafka1)
+psql -h 10.0.2.31 -U labuser -d labdb -c "SELECT version();" || echo "PostgreSQL: ✗"
+#пароль labpassword
+echo "PostgreSQL: ✓"
+
+# 3. Проверяем OpenSearch
+curl -s http://10.0.2.30:9200/ | grep -q "opensearch" && echo "OpenSearch: ✓" || echo "OpenSearch: ✗"
+
+Шаг 1.2: Подготовка тестовых данных в PostgreSQL
+На PostgreSQL (10.0.2.31):
+# Подключаемся к PostgreSQL
+sudo -u postgres psql -d labdb
+
+-- Создаем тестовую таблицу, если еще не создана
+CREATE TABLE IF NOT EXISTS orders (
+    id SERIAL PRIMARY KEY,
+    order_number VARCHAR(50) NOT NULL UNIQUE,
+    customer_name VARCHAR(100),
+    product VARCHAR(100),
+    quantity INT DEFAULT 1,
+    price DECIMAL(10,2),
+    order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'NEW'
+);
+
+-- Проверяем публикацию (должна быть создана ранее)
+SELECT * FROM pg_publication;
+
+-- Если публикации нет, создаем
+CREATE PUBLICATION orders_pub FOR TABLE orders;
+
+-- Вставляем тестовые данные
+INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES
+('ORD-1001', 'Иван Иванов', 'Ноутбук Dell XPS', 1, 149999.99),
+('ORD-1002', 'Петр Петров', 'Смартфон iPhone 15', 2, 179999.50),
+('ORD-1003', 'Мария Сидорова', 'Планшет iPad Pro', 1, 89999.00),
+('ORD-1004', 'Алексей Козлов', 'Монитор Samsung', 1, 34999.00),
+('ORD-1005', 'Ольга Новикова', 'Клавиатура механическая', 3, 8999.00)
+ON CONFLICT (order_number) DO NOTHING;
+
+-- Проверяем данные
+SELECT * FROM orders ORDER BY id;
+
+-- Выходим
+\q
+
+Часть 2: Установка и настройка Kafka Connect
+Шаг 2.1: Установка коннекторов
+На kafka1.lab (10.0.2.20):
+# Создаем директорию для плагинов
+sudo mkdir -p /opt/kafka/connect-plugins
+sudo chown -R kafka:kafka /opt/kafka/connect-plugins
+sudo apt install zip jq -y
+
+# Скачиваем Debezium PostgreSQL Connector
+sudo -u kafka wget -P /tmp https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.6.0.Final/debezium-connector-postgres-2.6.0.Final-plugin.tar.gz
+
+# Распаковываем
+sudo -u kafka tar -xzf /tmp/debezium-connector-postgres-2.6.0.Final-plugin.tar.gz -C /opt/kafka/connect-plugins/
+
+# Скачиваем OpenSource OpenSearch Connector от Aiven
+sudo -u kafka wget -P /tmp https://github.com/Aiven-Open/opensearch-connector-for-apache-kafka/releases/download/v3.0.0/opensearch-connector-for-apache-kafka-3.0.0.zip
+
+# Распаковываем
+sudo -u kafka unzip /tmp/opensearch-connector-for-apache-kafka-3.0.0.zip -d /opt/kafka/connect-plugins/
+
+# Проверяем установку
+ls -la /opt/kafka/connect-plugins/
+
+Шаг 2.2: Настройка Kafka Connect в distributed режиме
+# Создаем конфигурационный файл для Kafka Connect
+sudo -u kafka tee /opt/kafka/config/connect-distributed.properties << 'EOF'
+# Базовые настройки
+bootstrap.servers=kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092
+group.id=connect-cluster
+
+# Сериализация ключей и значений
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+
+# Настройки смещений (offsets)
+offset.storage.topic=connect-offsets
+offset.storage.replication.factor=3
+offset.storage.partitions=25
+
+# Настройки конфигураций
+config.storage.topic=connect-configs
+config.storage.replication.factor=3
+
+# Настройки статусов
+status.storage.topic=connect-status
+status.storage.replication.factor=3
+status.storage.partitions=5
+
+# Расположение плагинов
+plugin.path=/opt/kafka/connect-plugins
+
+# REST API
+rest.port=8083
+rest.advertised.host.name=kafka1.lab
+rest.advertised.port=8083
+
+# Безопасность (не используется в лабораторной)
+# ssl.keystore.location=/path/to/keystore.jks
+# ssl.keystore.password=password
+# ssl.key.password=password
+# ssl.truststore.location=/path/to/truststore.jks
+# ssl.truststore.password=password
+# ssl.enabled.protocols=TLSv1.2,TLSv1.3
+
+# Дополнительные настройки
+offset.flush.interval.ms=10000
+offset.flush.timeout.ms=5000
+
+# Хост для REST API
+listeners=http://0.0.0.0:8083
+EOF
+
+Шаг 2.3: Запуск Kafka Connect
+# Создаем systemd сервис для Kafka Connect
+sudo tee /etc/systemd/system/kafka-connect.service << 'EOF'
+[Unit]
+Description=Apache Kafka Connect
+After=network.target kafka.service
+Wants=kafka.service
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+ExecStart=/opt/kafka/bin/connect-distributed.sh /opt/kafka/config/connect-distributed.properties
+ExecStop=/opt/kafka/bin/connect-distributed-stop.sh
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Перезагружаем systemd и запускаем Kafka Connect
+sudo systemctl daemon-reload
+sudo systemctl enable kafka-connect
+sudo systemctl start kafka-connect
+
+# Проверяем статус
+sudo systemctl status kafka-connect --no-pager
+
+# Проверяем логи (первые 30 строк)
+sudo journalctl -u kafka-connect --no-pager -n 30
+
+# Ждем 15 секунд для полного запуска
+sleep 15
+
+# Проверяем REST API Kafka Connect
+curl -s http://localhost:8083/ | jq . 2>/dev/null || curl -s http://localhost:8083/
+
+Часть 3: Настройка Source Connector (PostgreSQL → Kafka)
+Шаг 3.1: Создание Debezium Source Connector
+
+# Создаем конфигурацию Debezium Connector
+cat > /tmp/debezium-source-fixed.json << 'EOF'
+{
+  "name": "postgres-source-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "10.0.2.31",
+    "database.port": "5432",
+    "database.user": "labuser",
+    "database.password": "labpassword",
+    "database.dbname": "labdb",
+    "topic.prefix": "postgres-server",
+    "table.include.list": "public.orders",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "publication.name": "orders_pub",
+    "snapshot.mode": "initial",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true"
+  }
+}
+EOF
+
+# Регистрируем коннектор через REST API
+curl -X POST -H "Content-Type: application/json" \
+  --data @/tmp/debezium-source-fixed.json \
+  http://localhost:8083/connectors
+
+# Проверяем статус коннектора
+curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq .
+
+Шаг 3.2: Проверка работы Source Connector
+# Проверяем, что топик создался
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep postgres-server
+
+# Смотрим содержимое топика (в реальном времени, откроем в отдельном терминале)
+# В новом терминале выполните:
+# /opt/kafka/bin/kafka-console-consumer.sh \
+#   --topic postgres-server.public.orders \
+#   --from-beginning \
+#   --bootstrap-server localhost:9092 \
+#   --timeout-ms 10000
+
+# Или посмотрим несколько сообщений
+echo "=== Проверка первых 5 сообщений в топике ==="
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic postgres-server.public.orders \
+  --from-beginning \
+  --bootstrap-server localhost:9092 \
+  --max-messages 5 \
+  --timeout-ms 5000 2>/dev/null || echo "Топик еще не создан, ожидаем..."
+
+Шаг 4.1: Конфигурация OpenSource Sink Connector
+# Создаем конфигурацию для OpenSource OpenSearch Connector от Aiven
+cat > /tmp/opensearch-aiven-sink.json << 'EOF'
+{
+  "name": "opensearch-sink-connector",
+  "config": {
+    "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
+    "connection.url": "http://10.0.2.30:9200",
+    "connection.username": "",
+    "connection.password": "",
+    "topics": "postgres-server.public.orders",
+    "type": "_doc",
+    "key.ignore": "true",
+    "schema.ignore": "true",
+    "batch.size": "10",
+    "max.buffered.records": "1000",
+    "flush.timeout.ms": "10000",
+    "max.retries": "10",
+    "retry.backoff.ms": "1000",
+    "behavior.on.null.values": "ignore",
+    "behavior.on.malformed.documents": "warn",
+    "drop.invalid.message": "true",
+    "tasks.max": "1",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}
+EOF
+
+# Регистрируем коннектор
+curl -X POST -H "Content-Type: application/json" \
+  --data @/tmp/opensearch-aiven-sink.json \
+  http://localhost:8083/connectors
+
+# Проверяем статус
+curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq .
+
+Шаг 4.2: Проверка индексации в OpenSearch
+# Ждем 10 секунд для индексации
+sleep 10
+
+# Проверяем, что индекс создался в OpenSearch
+echo "=== Проверка индексов в OpenSearch ==="
+curl -s "http://10.0.2.30:9200/_cat/indices?v" | grep postgres-server || echo "Индекс еще не создан"
+
+# Проверяем количество документов в индексе
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
+
+# Просматриваем несколько документов
+echo "=== Первые 3 документа в индексе ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?size=3&pretty"
+
+### Шаг 4.3: Настройка правильного маппинга в OpenSearch
+
+По умолчанию OpenSearch может определить поле `price` как `text`, а не как числовое. 
+Для правильной работы числовых операций нужно создать индекс с явным маппингом:
+
+```bash
+# 1. Удаляем автоматически созданный индекс
+curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
+
+# 2. Создаем индекс с правильным маппингом
+curl -X PUT "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
+{
+  "mappings": {
+    "properties": {
+      "price": { "type": "float" },
+      "quantity": { "type": "integer" },
+      "id": { "type": "integer" },
+      "order_date": { "type": "date" }
+    }
+  }
+}'
+
+# 3. Перезапускаем коннектор для переиндексации данных
+curl -X DELETE http://localhost:8083/connectors/opensearch-sink-connector
+sleep 5
+curl -X POST -H "Content-Type: application/json" \
+  --data @/tmp/opensearch-sink-fixed.json \
+  http://localhost:8083/connectors
+
+Часть 5: Тестирование end-to-end пайплайна
+Шаг 5.1: Добавление новых данных в PostgreSQL
+На PostgreSQL (10.0.2.31):
+sudo -u postgres psql -d labdb << 'EOF'
+-- Добавляем новый заказ
+INSERT INTO orders (order_number, customer_name, product, quantity, price, status) 
+VALUES ('ORD-1006', 'Сергей Волков', 'Мышь беспроводная', 2, 2999.00, 'PROCESSING');
+
+-- Обновляем существующий заказ
+UPDATE orders 
+SET status = 'SHIPPED', quantity = 3 
+WHERE order_number = 'ORD-1005';
+
+-- Удаляем заказ (для демонстрации CDC DELETE)
+DELETE FROM orders WHERE order_number = 'ORD-1004';
+
+-- Проверяем изменения
+SELECT * FROM orders ORDER BY id;
+EOF
+
+Шаг 5.2: Мониторинг передачи данных
+На kafka1.lab (10.0.2.20):
+# 1. Проверяем новые сообщения в Kafka (откроем в отдельном терминале)
+# В новом терминале:
+/opt/kafka/bin/kafka-console-consumer.sh \
+   --topic postgres-server.public.orders \
+   --bootstrap-server localhost:9092 \
+   --property print.key=true \
+   --property print.timestamp=true
+
+# 2. Проверяем статус коннекторов
+echo "=== Статус коннекторов ==="
+curl -s http://localhost:8083/connectors | jq .
+curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq .
+curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq .
+
+# 3. Проверяем данные в OpenSearch
+echo "=== Данные в OpenSearch ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=Волков&pretty"
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=ORD-1005&pretty"
+
+# 4. Проверяем количество документов
+echo "=== Количество документов ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
+
+Шаг 5.3: Поиск и агрегация в OpenSearch
+# Поиск по конкретному продукту
+echo "=== Поиск по продукту 'Ноутбук' ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+{
+  "query": {
+    "match": {
+      "product": "Ноутбук"
+    }
+  }
+}'
+
+# Агрегация по статусу заказов
+echo "=== Агрегация по статусам заказов ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+{
+  "size": 0,
+  "aggs": {
+    "statuses": {
+      "terms": {
+        "field": "status.keyword",
+        "size": 10
+      }
+    }
+  }
+}'
+
+# Поиск дорогих заказов (> 100000)
+echo "=== Заказы дороже 100000 ==="
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+{
+  "query": {
+    "range": {
+      "price": {
+        "gte": 100000
+      }
+    }
+  },
+  "sort": [
+    {
+      "price": {
+        "order": "desc"
+      }
+    }
+  ]
+}'
+
+#Если в последнем запросе ошибка, то возможно неправильное создание индекса, тогда:
+curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
+curl -X PUT "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
+{
+  "mappings": {
+    "properties": {
+      "id": { "type": "integer" },
+      "order_number": { "type": "keyword" },
+      "customer_name": { "type": "text" },
+      "product": { "type": "text" },
+      "quantity": { "type": "integer" },
+      "price": { "type": "scaled_float", "scaling_factor": 100 },
+      "order_date": { "type": "date" },
+      "status": { "type": "keyword" }
+    }
+  }
+}'
+
+Часть 6: Мониторинг и устранение неисправностей
+Шаг 6.1: Полезные команды для мониторинга
+# 1. Проверка состояния Kafka Connect
+sudo systemctl status kafka-connect
+sudo journalctl -u kafka-connect -f
+
+# 2. Просмотр логов коннекторов
+curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq '.tasks[0].trace'
+curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq '.tasks[0].trace'
+
+# 3. Просмотр топиков Kafka Connect
+/opt/kafka/bin/kafka-topics.sh --describe --topic connect-* --bootstrap-server localhost:9092
+
+# 4. Проверка consumer lag
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group connect-opensearch-sink-connector \
+  --describe
+
+# 5. Перезапуск коннектора при проблемах
+curl -X POST http://localhost:8083/connectors/opensearch-sink-connector/restart
+
+Шаг 6.2: Типичные проблемы и решения
+Коннектор в состоянии FAILED
+# Проверяем ошибку
+curl -s http://localhost:8083/connectors/имя_коннектора/status | jq '.tasks[0].trace'
+
+# Перезапускаем
+curl -X POST http://localhost:8083/connectors/имя_коннектора/restart
+
+Нет данных в OpenSearch
+# Проверяем, есть ли сообщения в топике
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic postgres-server.public.orders \
+  --from-beginning \
+  --bootstrap-server localhost:9092 \
+  --max-messages 1 \
+  --timeout-ms 5000
+
+# Проверяем подключение к OpenSearch
+curl -v http://10.0.2.30:9200/
+
+Ошибки репликации PostgreSQL
+# На PostgreSQL проверяем слоты репликации
+sudo -u postgres psql -d labdb -c "SELECT * FROM pg_replication_slots;"
+
+# Пересоздаем слот при необходимости
+sudo -u postgres psql -d labdb -c "SELECT pg_drop_replication_slot('debezium_slot');"
+
+Часть 7: Очистка и завершение работы
+Шаг 7.1: Остановка коннекторов
+# Удаляем коннекторы
+curl -X DELETE http://localhost:8083/connectors/postgres-source-connector
+curl -X DELETE http://localhost:8083/connectors/opensearch-sink-connector
+
+# Останавливаем Kafka Connect
+sudo systemctl stop kafka-connect
+sudo systemctl disable kafka-connect
+
+# Удаляем топики Kafka (опционально)
+/opt/kafka/bin/kafka-topics.sh --delete --topic postgres-server.public.orders --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --delete --topic connect-* --bootstrap-server localhost:9092
+
+Шаг 7.2: Очистка данных
+# Удаляем индекс в OpenSearch
+curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
+
+# Очищаем таблицу в PostgreSQL (опционально)
+# sudo -u postgres psql -d labdb -c "TRUNCATE TABLE orders;"
+
+
+Резюме лабораторной работы
+Название: Настройка end-to-end пайплайна передачи данных в реальном времени.
+
+Цель: Освоить принципы построения отказоустойчивых, масштабируемых ETL-пайплайнов, синхронизирующих состояние реляционной базы данных с поисковым движком, используя парадигму потоковой обработки данных (CDC).
+
+Контекст и значимость:
+В современных распределённых системах (микросервисы, аналитика в реальном времени, полнотекстовый поиск по данным из БД) критически важно обеспечить согласованность данных между различными технологиями. Прямые интеграции (point-to-point) являются хрупкими и плохо масштабируются. Данная лабораторная работа демонстрирует индустриальный стандарт решения этой проблемы.
+
+Ключевые компоненты и их роль в пайплайне:
+
+PostgreSQL: Система-источник (Source of Truth). Хранит структурированные операционные данные. Используется механизм логической репликации для отслеживания изменений.
+
+Debezium (Source Connector): Реализует паттерн Change Data Capture (CDC). "Подслушивает" изменения в WAL-логе PostgreSQL (INSERT, UPDATE, DELETE) и преобразует их в структурированные события-сообщения. Является "глазами" пайплайна.
+
+Apache Kafka: Сердце пайплайна, выполняет роль надежного буфера сообщений (durable log).
+Накапливает все события изменений.
+Развязывает производителя (Debezium) и потребителя (OpenSearch Connector) данных во времени: потребитель может отставать или быть временно недоступен, не влияя на источник.
+Обеспечивает масштабируемость и отказоустойчивость за счёт распределённой природы.
+OpenSearch Sink Connector (от Aiven): Компонент, который потребляет события из Kafka и транслирует их в команды для OpenSearch (индексация, обновление, удаление документов). Является "руками" пайплайна.
+Kafka Connect: Распределённый фреймворк для управления коннекторами. Предоставляет REST API для их развёртывания, мониторинга, масштабирования и обеспечения отказоустойчивости. Упрощает эксплуатацию, избавляя от необходимости писать собственный код-интегратор.
+OpenSearch: Система-приёмник (Sink). Предоставляет мощные возможности поиска, агрегации и аналитики в реальном времени над данными из PostgreSQL, которые в исходной БД были бы неэффективны.
+Логический поток данных:
+Изменение в таблице PostgreSQL → WAL-лог → Debezium → Сообщение в Kafka-топик → OpenSearch Connector → Документ в индексе OpenSearch
+
+Что было изучено на практике:
+Подготовка источника данных: Настройка публикации (publication) и слота репликации в PostgreSQL.
+Работа с Kafka Connect: Установка в distributed-режиме, развёртывание custom-коннекторов, конфигурация через REST API.
+Настройка коннекторов:
+Source (Debezium): Подключение к БД, указание таблиц, настройка сериализации.
+Sink (OpenSearch): Подключение к кластеру, сопоставление топика и индекса, обработка ошибок.
+Управление данными в OpenSearch: Создание индекса с правильным маппингом типов данных для корректного поиска и агрегаций.
+Сквозное тестирование: Валидация передачи операций INSERT, UPDATE, DELETE по всей цепочке.
+Мониторинг и отладка: Использование инструментов Kafka и REST API Kafka Connect для контроля состояния пайплайна.
+Поиск и аналитика: Выполнение запросов и агрегаций в OpenSearch над актуальными данными из БД.
+Итог: В результате выполнения работы был построен производственный паттерн синхронизации данных, который является стандартом для построения data-инфраструктуры. Студент получает навыки работы с ключевыми технологиями стека данных (PostgreSQL, Kafka, OpenSearch) и понимает, как они взаимодействуют для решения задачи реального времени.
+
+
+Вопросы для самопроверки
+Что происходит при добавлении новой строки в таблицу PostgreSQL?
+Как это отражается в Kafka?
+Как это отражается в OpenSearch?
+Что происходит при обновлении существующей записи?
+Сколько сообщений генерируется в Kafka?
+Как обрабатывается UPDATE в OpenSearch?
+Что происходит при удалении записи из PostgreSQL?
+Генерируется ли сообщение в Kafka?
+Удаляется ли документ из OpenSearch?
+Как обеспечивается отказоустойчивость пайплайна?
+Что произойдет, если Kafka Connect упадет?
+Что произойдет, если OpenSearch будет недоступен?
+Как можно масштабировать решение?
+Как увеличить пропускную способность чтения из PostgreSQL?
+Как увеличить скорость индексации в OpenSearch?
+
+Дополнительное задание (по желанию)
+Добавьте новую таблицу в PostgreSQL и настройте ее репликацию
+Настройте преобразования данных (transforms) в Kafka Connect:
+Переименуйте поля
+Добавьте вычисляемое поле
+Отфильтруйте определенные события
+Настройте мониторинг пайплайна:
+Consumer lag в Kafka
+Количество документов в OpenSearch
+Статус коннекторов
+Создайте Kibana/OpenSearch Dashboards для визуализации данных

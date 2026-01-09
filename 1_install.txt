@@ -1,0 +1,466 @@
+Для выполнения лабораторной используется 5 VM на Debian 13 с 2 ядрами и 4 Гб RAM
+Лабораторная: Установка Kafka KRaft кластер на 3 VM 
+1) Предварительная настройка VM
+На КАЖДОЙ VM (kafka1,2,3):
+# Обновление + Java 21
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y openjdk-21-jdk wget curl net-tools htop ufw
+# Создать пользователя kafka
+sudo useradd -r -m -U -s /bin/bash kafka
+
+# /etc/hosts (замените IP на свои!)
+cat >> /etc/hosts << EOF
+10.0.2.20 kafka1.lab
+10.0.2.21 kafka2.lab  
+10.0.2.22 kafka3.lab
+EOF
+
+# Hostname (на kafka1: kafka1.lab, на kafka2: kafka2.lab, на kafka3: kafka3.lab)
+sudo hostnamectl set-hostname kafka1.lab
+
+# Firewall
+sudo ufw allow from 10.0.2.0/24 to any port 9092:9095 proto tcp
+sudo ufw --force enable
+sudo ufw status  # Должно быть 9092-9095 ALLOW
+
+
+2) Установка kafka
+# Скачать Kafka 4.1.1
+cd /opt
+sudo wget https://downloads.apache.org/kafka/4.1.1/kafka_2.13-4.1.1.tgz
+sudo tar xzf kafka_2.13-4.1.1.tgz
+sudo mv kafka_2.13-4.1.1 kafka
+sudo chown -R kafka:kafka /opt/kafka
+
+# Сгенерировать UUID (один раз!)
+CLUSTER_ID=$(/opt/kafka/bin/kafka-storage.sh random-uuid)
+echo $CLUSTER_ID > /tmp/cluster-id.txt
+echo "Cluster ID: $CLUSTER_ID"  # Скопируйте на kafka2/3!
+# После генерации на kafka1:
+echo "Cluster ID для копирования: $CLUSTER_ID"
+# На kafka2 и kafka3 выполнить:
+# CLUSTER_ID=<скопированное_значение>
+# echo $CLUSTER_ID > /tmp/cluster-id.txt
+
+На КАЖДОЙ VM: Конфигурация + Форматирование
+# Config для kafka1 (адаптируйте node.id и IP!)
+sudo apt install postgresql-client -y
+sudo mkdir -p /opt/kafka/config/kraft
+sudo tee /opt/kafka/config/kraft/server.properties << 'EOF'
+# ============================================
+# НАСТРОЙКИ KRaft 
+#process.roles - В режиме KRaft нода может быть брокером, контроллером или обоими. В нашем кластере каждая нода выполняет обе роли для простоты.
+#controller.quorum.voters - Это список всех контроллеров. Важно, чтобы он был одинаковым на всех нодах.
+# ============================================
+
+# Роли процесса: broker - хранит данные, controller - управляет кластером
+process.roles=broker,controller
+
+# Уникальный ID ноды (1-3 для нашего кластера)
+node.id=1
+
+# Контроллеры кворума: список всех контроллеров в формате id@host:port
+controller.quorum.voters=1@kafka1.lab:9093,2@kafka2.lab:9093,3@kafka3.lab:9093
+
+# ============================================
+# НАСТРОЙКИ СЕТЕВЫХ ИНТЕРФЕЙСОВ
+#advertised.listeners - Критически важная настройка! Клиенты будут использовать этот адрес для подключения. Если Kafka запущена в контейнере или за NAT, здесь должен быть внешний адрес.
+#inter.broker.listener.name - Определяет, какой интерфейс использовать для общения между брокерами.
+# ============================================
+
+# Слушатели: какие интерфейсы и порты слушает Kafka
+# PLAINTEXT:// - для клиентов (продюсеры/консюмеры), порт 9092
+# CONTROLLER:// - для общения контроллеров между собой, порт 9093
+listeners=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+
+# Адрес, который сообщается клиентам для подключения (внешний/публичный IP)
+advertised.listeners=PLAINTEXT://10.0.2.20:9092
+
+# Имя слушателя для контроллеров
+controller.listener.names=CONTROLLER
+
+# Соответствие имен слушателей протоколам безопасности
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+# Имя слушателя для общения между брокерами
+inter.broker.listener.name=PLAINTEXT
+
+# ============================================
+# НАСТРОЙКИ ХРАНЕНИЯ ДАННЫХ И ПРОИЗВОДИТЕЛЬНОСТИ
+# ============================================
+
+# Директории для хранения логов (партиций) Kafka
+log.dirs=/opt/kafka/data
+
+# Количество потоков для обработки сетевых запросов (оптимизировано для 2 ядер)
+num.network.threads=3
+
+# Количество потоков для операций ввода-вывода на диск
+num.io.threads=8
+
+# Размер буфера отправки сокета в байтах
+socket.send.buffer.bytes=102400
+
+# Размер буфера приема сокета в байтах
+socket.receive.buffer.bytes=102400
+
+# Время хранения сообщений (168 часов = 7 дней)
+log.retention.hours=168
+
+# Максимальный размер логов на брокер (1 ГБ = 1073741824 байт)
+log.retention.bytes=1073741824
+
+# ============================================
+# НАСТРОЙКИ ОТКАЗОУСТОЙЧИВОСТИ И РЕПЛИКАЦИИ
+#min.insync.replicas=2 - Гарантирует, что запись считается успешной, когда минимум 2 из 3 реплик подтвердили её. Это обеспечивает отказоустойчивость при потере одной ноды.
+#default.replication.factor=3 - Все новые топики будут создаваться с 3 репликами автоматически.
+# ============================================
+
+# Фактор репликации для топика __consumer_offsets (системный топик)
+offsets.topic.replication.factor=3
+
+# Фактор репликации для топиков транзакций
+transaction.state.log.replication.factor=3
+
+# Минимальное количество In-Sync Replicas для топиков транзакций
+transaction.state.log.min.isr=2
+
+# Фактор репликации по умолчанию для новых топиков
+default.replication.factor=3
+
+# Минимальное количество синхронизированных реплик для подтверждения записи
+# Устанавливает баланс между доступностью и надежностью
+# 2 из 3 реплик должны подтвердить запись
+min.insync.replicas=2
+EOF
+# Data dir
+sudo mkdir -p /opt/kafka/data
+sudo chown -R kafka:kafka /opt/kafka
+
+# Форматировать storage (используйте ваш CLUSTER_ID!)
+sudo /opt/kafka/bin/kafka-storage.sh format -t $(cat /tmp/cluster-id.txt) -c /opt/kafka/config/kraft/server.properties
+
+kafka2: node.id=2, advertised.listeners=PLAINTEXT://10.0.2.21:9092
+kafka3: node.id=3, 10.0.2.22:9092
+
+Почему именно 3 реплики? - 3 реплики позволяют пережить отказ 1 ноды без потери данных и с сохранением доступности для записи (при min.insync.replicas=2).
+Разница между listeners и advertised.listeners:
+listeners - на каких интерфейсах Kafka принимает соединения
+advertised.listeners - какой адрес сообщается клиентам
+Зачем нужен controller.listener.names? - Он отделяет трафик управления кластером от клиентского трафика.
+Что такое log.retention? - Kafka хранит сообщения по времени ИЛИ по размеру (что наступит раньше).
+
+
+#Запуск кластера (10 мин)
+На КАЖДОЙ VM:
+# systemd service
+sudo tee /etc/systemd/system/kafka.service << EOF
+[Unit]
+Description=Apache Kafka Server
+After=network.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties
+ExecStop=/opt/kafka/bin/kafka-server-stop.sh /opt/kafka/config/kraft/server.properties
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable kafka
+sudo systemctl start kafka
+sudo systemctl status kafka  # Active: active (running)
+
+Проверьте логи: sudo journalctl -u kafka -f
+
+
+#Тестирование
+С kafka1.lab:
+# Статус кластера
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+
+выполняет ApiVersions-запрос к брокеру Kafka и возвращает:
+список всех Kafka API, которые понимает брокер;
+диапазоны версий протокола для каждого API;
+какие версии реально можно использовать клиенту при подключении.
+Проще говоря:
+это «паспорт совместимости» брокера Kafka.
+
+Расшифровка:
+Поле	Значение
+10.0.2.20:9092	Адрес брокера, к которому реально подключились
+id: 1	broker.id
+rack: null	Rack Awareness не настроен
+isFenced: false	Брокер активен и не «заблокирован» (важно для KRaft/контроллеров)
+Формат строк API
+Produce(0): 0 to 13 [usable: 13]
+Produce	Название Kafka API
+(0)	Числовой API key (жёстко зашит в протоколе Kafka)
+0 to 13	Диапазон версий протокола, которые поддерживает брокер
+[usable: 13]	Версия, которую выберет клиент при согласовании
+
+Produce(0): 0 to 13
+Fetch(1): 4 to 18
+Produce — запись сообщений продюсерами
+Fetch — чтение сообщений консьюмерами и репликами
+Чем выше версия:
+больше оптимизаций,
+поддержка idempotent producer,
+транзакции,
+zero-copy и улучшения батчинга.
+
+Metadata и служебные запросы
+Metadata(3): 0 to 13
+ApiVersions(18): 0 to 4
+DescribeCluster(60): 0 to 2
+Используются клиентами для:
+получения списка брокеров,
+топиков и партиций,
+определения лидеров,
+согласования версий API.
+
+
+
+# Создать топик (6 partitions, RF=3)
+sudo /opt/kafka/bin/kafka-topics.sh --create --topic lab-topic --bootstrap-server localhost:9092 --partitions 6 --replication-factor 3
+
+# Проверить репликацию
+/opt/kafka/bin/kafka-topics.sh --describe --topic lab-topic --bootstrap-server localhost:9092
+# Ожидаемо: Leader:1 Replicas:1,2,3 ISR:1,2,3 (для всех 6 partitions)
+
+# Producer
+/opt/kafka/bin/kafka-console-producer.sh --topic lab-topic --bootstrap-server kafka1.lab:9092,kafka2.lab:9092 <<<'{"msg": "test1"}'
+
+# Consumer
+/opt/kafka/bin/kafka-console-consumer.sh --topic lab-topic --from-beginning --bootstrap-server localhost:9092 --max-messages 1
+# Проверить метаданные кластера
+/opt/kafka/bin/kafka-metadata-shell.sh --snapshot /opt/kafka/data/__cluster_metadata-0/*.log
+
+# Проверить все топики (включая системные)
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+
+# Проверить потребление (consumer lag)
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
+
+#Failover тест
+# На kafka1: Убить leader
+sudo systemctl stop kafka  # Broker1 down
+
+# С kafka2: Проверить
+/opt/kafka/bin/kafka-topics.sh --describe --topic lab-topic --bootstrap-server kafka2.lab:9092
+# Новый Leader: 2 (или 3), ISR:2,3
+
+# Восстановить
+sudo systemctl start kafka  # На kafka1, ISR восстановится
+
+Готово! Вы восхитительны!
+#Troubleshooting 
+# Если Kafka не запускается:
+sudo journalctl -u kafka -n 50 --no-pager
+
+# Если ноды не соединяются:
+sudo netstat -tlnp | grep 9092
+sudo ss -tlnp | grep :9092
+
+# Если проблемы с диском:
+df -h /opt/kafka
+sudo du -sh /opt/kafka/data/*
+
+
+#VM postgresql с установленным PostgreSQL17
+Предварительная настройка PostgreSQL (10.0.2.31)
+1. Настройка PostgreSQL для CDC (Change Data Capture)
+# Подключаемся к виртуалке с PostgreSQL
+ssh user@10.0.2.31
+
+# 1. Останавливаем PostgreSQL для настройки
+sudo systemctl stop postgresql
+
+# 2. Настраиваем конфигурацию для логической репликации
+sudo nano /etc/postgresql/15/main/postgresql.conf
+# Разрешаем логическую репликацию
+wal_level = logical
+
+# Максимальное количество репликационных слотов
+max_replication_slots = 10
+
+# Максимальное количество процессов WAL sender
+max_wal_senders = 10
+
+# Разрешаем подключение с других IP
+listen_addresses = '*'
+
+# Увеличиваем размер shared buffers (опционально)
+shared_buffers = 128MB
+2. Настройка аутентификации
+# 3. Редактируем pg_hba.conf для разрешения подключений
+sudo nano /etc/postgresql/15/main/pg_hba.conf
+Добавить в конец файла:
+# Разрешаем подключение из сети 10.0.2.0/24
+host    all             all             10.0.2.0/24            md5
+host    replication     all             10.0.2.0/24            md5
+3. Создание тестовой базы данных и пользователя
+# 4. Перезапускаем PostgreSQL
+sudo systemctl start postgresql
+
+# 5. Подключаемся к PostgreSQL
+sudo -u postgres psql
+
+# 6. Создаем тестовую базу данных
+CREATE DATABASE labdb;
+
+# 7. Создаем пользователя для подключения
+CREATE USER labuser WITH PASSWORD 'labpassword';
+
+# 8. Даем права пользователю
+GRANT ALL PRIVILEGES ON DATABASE labdb TO labuser;
+ALTER USER labuser WITH REPLICATION;
+
+# 9. Подключаемся к базе labdb
+\c labdb
+
+# 10. Создаем тестовую таблицу
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    order_number VARCHAR(50) NOT NULL,
+    customer_name VARCHAR(100),
+    product VARCHAR(100),
+    quantity INT DEFAULT 1,
+    price DECIMAL(10,2),
+    order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'NEW'
+);
+
+# 11. Включаем логирование изменений для таблицы (публикацию)
+CREATE PUBLICATION orders_pub FOR TABLE orders;
+
+# 12. Даем права на таблицу
+GRANT ALL PRIVILEGES ON TABLE orders TO labuser;
+GRANT USAGE, SELECT ON SEQUENCE orders_id_seq TO labuser;
+
+# 13. Добавляем тестовые данные
+INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES
+('ORD-001', 'Иван Иванов', 'Ноутбук', 1, 150000.00),
+('ORD-002', 'Петр Петров', 'Смартфон', 2, 80000.00),
+('ORD-003', 'Мария Сидорова', 'Планшет', 1, 50000.00);
+
+# 14. Выходим из psql
+\q
+4. Проверка настроек
+# 15. Проверяем, что PostgreSQL слушает на всех интерфейсах
+sudo netstat -tlnp | grep 5432
+# Должно быть: 0.0.0.0:5432 или :::5432
+
+# 16. Проверяем подключение с другой ноды
+# С kafka1.lab:
+psql -h 10.0.2.31 -U labuser -d labdb
+# Пароль: labpassword
+
+# 17. Проверяем публикацию
+SELECT * FROM pg_publication;
+\q
+
+Предварительная настройка Elasticsearch (10.0.2.30)
+mkdir -p opensearch-lab/data
+
+подготовленный Docker Compose
+cat > /home/engineer/opensearch-lab/docker-compose.yml << 'EOF'
+version: '3.8'
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - ./data:/usr/share/opensearch/data
+    networks:
+      - lab-network
+
+  # Дополнительно: OpenSearch Dashboards (аналог Kibana)
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: dashboards
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - opensearch
+    networks:
+      - lab-network
+
+networks:
+  lab-network:
+    driver: bridge
+EOF
+
+chmod 777 -R opensearch-lab
+cd opensearch-lab
+docker compose up -d
+
+Проверка
+# Проверить OpenSearch
+curl http://localhost:9200/
+
+# Проверить Dashboards (веб-интерфейс)
+# Откройте в браузере: http://10.0.2.30:5601
+
+Основные команды
+# Просмотр логов
+docker-compose logs -f opensearch
+
+# Остановка
+docker-compose down
+
+# Перезапуск
+docker-compose restart
+
+# Проверить статус
+docker-compose ps
+
+Доступ к OpenSearch
+Адрес: http://10.0.2.30:9200
+Адрес Dashboards: http://10.0.2.30:5601
+
+
+##Проверка подключения с других машин
+
+
+# С kafka1.lab (10.0.2.20) проверяем:
+curl -X GET "http://10.0.2.30:9200/"
+
+# Если не работает, проверяем фаервол на 10.0.2.30:
+sudo ufw allow 9200/tcp
+sudo ufw allow 5601/tcp
+
+Тестовые запросы для проверки
+# Создадим тестовый индекс
+curl -X PUT "http://10.0.2.30:9200/test-index" -H 'Content-Type: application/json' -d'
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  }
+}'
+
+# Добавим документ
+curl -X POST "http://10.0.2.30:9200/test-index/_doc/1" -H 'Content-Type: application/json' -d'
+{
+  "message": "Hello OpenSearch",
+  "timestamp": "2024-01-08"
+}'
+
+# Поиск
+curl -X GET "http://10.0.2.30:9200/test-index/_search?pretty"

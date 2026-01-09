@@ -1,0 +1,732 @@
+Лабораторная работа 3.3: Настройка мониторинга кластера Kafka с Prometheus и алертами на лаг
+Цель работы
+Настроить комплексную систему мониторинга для кластера Apache Kafka с использованием Prometheus, Alertmanager и Grafana. Научиться собирать метрики с брокеров Kafka через kafka-exporter, настраивать алерты на критически важные показатели (особенно на лаг консумеров) и визуализировать метрики в Grafana.
+
+Архитектура решения
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Kafka Brokers │    │   PostgreSQL    │    │   OpenSearch    │
+│   (3 ноды)      │    │   (10.0.2.31)   │    │   (10.0.2.30)   │
+└───────┬─────────┘    └────────┬────────┘    └────────┬────────┘
+        │                       │                       │
+        ▼                       ▼                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                Система мониторинга                          │
+│                 (10.0.2.30 - Docker)                        │
+│  ┌───────────┐   ┌─────────────┐  ┌─────────────┐          │
+│  │Prometheus │◄──┤kafka-exporter│  │  Grafana    │          │
+│  │  :9090    │   │   :9308      │  │   :3000     │          │
+│  └─────┬─────┘   └─────────────┘  └─────────────┘          │
+│        │                                                    │
+│        ▼                                                    │
+│  ┌─────────────┐  ┌─────────────────┐                      │
+│  │Alertmanager │  │  Node Exporter  │                      │
+│  │   :9093     │  │  (на нодах)     │                      │
+│  └─────────────┘  └─────────────────┘                      │
+└─────────────────────────────────────────────────────────────┘
+
+Часть 1: Подготовка окружения на VM OpenSearch (10.0.2.30)
+Шаг 1.1: Установка необходимых пакетов
+# Подключаемся к OpenSearch ноде
+ssh engineer@10.0.2.30
+
+# Обновляем систему
+sudo apt update && sudo apt upgrade -y
+
+# Устанавливаем необходимые утилиты
+sudo apt install -y wget curl git jq vim net-tools python3-pip tree
+
+# Проверяем наличие Docker
+docker --version
+docker compose --version
+
+# Если Docker не установлен, устанавливаем
+if ! command -v docker &> /dev/null; then
+    echo "Установка Docker..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sudo sh get-docker.sh
+    sudo usermod -aG docker $USER
+    newgrp docker
+fi
+
+# Если docker compose не установлен, устанавливаем
+if ! command -v docker compose &> /dev/null; then
+    echo "Установка Docker Compose..."
+    sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker compose
+    sudo chmod +x /usr/local/bin/docker compose
+fi
+
+Шаг 1.2: Создание структуры директорий
+# Создаем рабочую директорию
+mkdir -p ~/kafka-monitoring/{prometheus,alertmanager,grafana,configs}
+cd ~/kafka-monitoring
+
+# Структура директорий
+tree .
+
+Часть 2: Настройка сбора метрик с Kafka кластера
+Шаг 2.1: Установка Node Exporter на нодах Kafka
+# На каждой ноде Kafka (kafka1, kafka2, kafka3) выполняем:
+
+# 1. Скачиваем Node Exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+
+# 2. Распаковываем
+tar -xzf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo mv node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+sudo chmod +x /usr/local/bin/node_exporter
+
+# 3. Создаем systemd сервис
+sudo tee /etc/systemd/system/node-exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.systemd \
+  --collector.processes \
+  --collector.filesystem \
+  --collector.netstat \
+  --collector.meminfo \
+  --collector.cpu
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4. Создаем пользователя для Node Exporter
+sudo useradd -rs /bin/false prometheus
+
+# 5. Запускаем Node Exporter
+sudo systemctl daemon-reload
+sudo systemctl enable node-exporter
+sudo systemctl start node-exporter
+
+# 6. Проверяем статус
+sudo systemctl status node-exporter
+
+Часть 3: Развертывание стека мониторинга через Docker Compose
+Шаг 3.1: Создание docker compose.yml
+# На OpenSearch ноде (10.0.2.30) создаем docker compose файл
+cd ~/kafka-monitoring
+
+cat > docker-compose.yml << 'EOF'
+version: '3.8'
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus_data: {}
+  grafana_data: {}
+  alertmanager_data: {}
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager_data:/alertmanager
+    ports:
+      - "9093:9093"
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    networks:
+      - monitoring
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    restart: unless-stopped
+    command:
+      - '--kafka.server=10.0.2.20:9092'
+      - '--kafka.server=10.0.2.21:9092'
+      - '--kafka.server=10.0.2.22:9092'
+      - '--web.listen-address=:9308'
+      - '--log.level=info'
+    ports:
+      - "9308:9308"
+    networks:
+      - monitoring
+EOF
+
+Шаг 3.2: Настройка конфигурации Prometheus
+# Создаем конфигурационный файл Prometheus
+mkdir -p prometheus
+cat > prometheus/prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'kafka-cluster'
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # Prometheus сам по себе
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Node Exporters на нодах Kafka
+  - job_name: 'node-exporter-kafka'
+    static_configs:
+      - targets:
+          - '10.0.2.20:9100'
+          - '10.0.2.21:9100'
+          - '10.0.2.22:9100'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):\d+'
+        replacement: '${1}'
+
+  # Kafka Exporter для метрик Kafka
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+    metrics_path: '/metrics'
+
+  # Kafka Connect (если есть)
+  - job_name: 'kafka-connect'
+    static_configs:
+      - targets: ['10.0.2.20:8083']
+    metrics_path: '/metrics'
+EOF
+
+Шаг 3.3: Настройка алертов для Kafka
+# Создаем файл с правилами алертов
+cat > prometheus/alerts.yml << 'EOF'
+groups:
+  - name: kafka_alerts
+    rules:
+      # Алерт на высокий consumer lag
+      - alert: HighConsumerLag
+        expr: |
+          kafka_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: critical
+          service: kafka
+        annotations:
+          summary: "Высокий лаг консумера"
+          description: "Consumer group имеет лаг {{ $value }} сообщений"
+
+      # Алерт на недоступность брокера Kafka
+      - alert: KafkaBrokerDown
+        expr: |
+          kafka_brokers < 3
+        for: 1m
+        labels:
+          severity: critical
+          service: kafka
+        annotations:
+          summary: "Брокер Kafka недоступен"
+          description: "Только {{ $value }} брокеров доступно из 3"
+
+      # Алерт на высокую загрузку CPU
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "Высокая загрузка CPU на {{ $labels.instance }}"
+          description: "Загрузка CPU составляет {{ $value }}%"
+
+      # Алерт на нехватку памяти
+      - alert: HighMemoryUsage
+        expr: |
+          (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "Высокое использование памяти на {{ $labels.instance }}"
+          description: "Используется {{ $value | humanizePercentage }} памяти"
+
+      # Алерт на нехватку дискового пространства
+      - alert: HighDiskUsage
+        expr: |
+          (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_free_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "Высокое использование диска на {{ $labels.instance }}"
+          description: "Используется {{ $value | humanizePercentage }} дискового пространства"
+EOF
+
+Шаг 3.4: Настройка Alertmanager
+# Создаем конфигурацию Alertmanager
+mkdir -p alertmanager
+cat > alertmanager/alertmanager.yml << 'EOF'
+global:
+  smtp_smarthost: 'mail.netangels.ru:587'
+  smtp_from: 'alert@iklimarev.ru'
+  smtp_auth_username: 'alert@iklimarev.ru'
+  smtp_auth_password: 'your-app-password'
+  smtp_require_tls: true
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'default-receiver'
+
+receivers:
+  - name: 'default-receiver'
+    email_configs:
+      - to: 'admin@example.com'
+        send_resolved: true
+
+# Для тестирования можно использовать простую конфигурацию без SMTP
+EOF
+
+# Альтернативная конфигурация для тестирования
+cat > alertmanager/alertmanager-test.yml << 'EOF'
+route:
+  receiver: 'null'
+
+receivers:
+  - name: 'null'
+EOF
+
+Часть 4: Настройка Grafana и дашбордов
+Шаг 4.1: Создание provisioning конфигурации для Grafana
+# Создаем директории для Grafana
+mkdir -p grafana/provisioning/{datasources,dashboards}
+mkdir -p grafana/dashboards
+
+# Создаем конфигурацию источника данных
+cat > grafana/provisioning/datasources/datasource.yml << 'EOF'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+EOF
+
+# Создаем конфигурацию дашбордов
+cat > grafana/provisioning/dashboards/dashboards.yml << 'EOF'
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+
+Шаг 4.2: Создание простого дашборда для Kafka
+# Создаем дашборд для мониторинга Kafka
+cat > grafana/dashboards/kafka-overview.json << 'EOF'
+{
+  "title": "Kafka Cluster Overview",
+  "panels": [
+    {
+      "title": "Consumer Lag",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "kafka_consumer_lag",
+          "legendFormat": "{{group}}"
+        }
+      ]
+    },
+    {
+      "title": "Messages In Per Second",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "rate(kafka_topic_partition_current_offset[1m])",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "title": "Active Brokers",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "kafka_brokers",
+          "instant": true
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 33,
+  "tags": ["kafka", "monitoring"],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "uid": "kafka-overview",
+  "version": 1
+}
+EOF
+
+Шаг 4.3: Загрузка готовых дашбордов
+# Создаем скрипт для загрузки дашбордов
+cat > download-dashboards.sh << 'EOF'
+#!/bin/bash
+
+# Дашборд для Kafka Exporter (ID: 7589)
+wget -O grafana/dashboards/kafka-exporter.json https://grafana.com/api/dashboards/7589/revisions/1/download
+
+Важно: дашборд “Kafka Exporter (ID: 7589)” использует переменные job и instance,
+которые по умолчанию определяются через метрику
+kafka_consumergroup_current_offset. В используемой в лабораторной работе
+версии kafka-exporter эта метрика отсутствует, поэтому переменные job и
+instance в верхней части дашборда могут оставаться пустыми, а часть панелей —
+без данных. Это не является ошибкой конфигурации Prometheus или kafka-exporter.
+
+Основная проверка работы kafka-exporter в рамках лабораторной работы:
+- команда:
+  curl -s http://localhost:9308/metrics | grep -E "kafka_consumer_lag|kafka_brokers" | head -5
+  должна показать метрики kafka_brokers и kafka_consumer_lag;
+- в Prometheus по запросу kafka_brokers должно отображаться значение 3;
+- дашборд “Kafka Cluster Overview” (kafka-overview.json) должен показывать
+  количество брокеров, сообщения в секунду и лаг консумеров.
+
+
+
+# Дашборд для Node Exporter (ID: 1860)
+wget -O grafana/dashboards/node-exporter-full.json https://grafana.com/api/dashboards/1860/revisions/22/download
+
+# Дашборд для Prometheus (ID: 3662)
+wget -O grafana/dashboards/prometheus-overview.json https://grafana.com/api/dashboards/3662/revisions/1/download
+EOF
+
+chmod +x download-dashboards.sh
+./download-dashboards.sh
+
+# Исправляем источники данных в скачанных дашбордах
+for file in grafana/dashboards/*.json; do
+    if [ -f "$file" ]; then
+        echo "Исправление источника данных в $file"
+        sed -i 's/"datasource": "[^"]*"/"datasource": "Prometheus"/g' "$file"
+    fi
+done
+
+кастомный дашбоард
+# Создаем кастомный дашборд для kafka-exporter
+cat > grafana/dashboards/kafka-exporter-custom.json << 'EOF'
+{
+  "title": "Kafka Exporter Overview (Custom)",
+  "uid": "kafka-exporter-custom",
+  "tags": ["kafka", "exporter", "monitoring"],
+  "timezone": "browser",
+  "schemaVersion": 33,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Kafka Brokers",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "kafka_brokers",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "graph",
+      "title": "Consumer Lag (per group)",
+      "id": 2,
+      "gridPos": { "h": 8, "w": 12, "x": 4, "y": 0 },
+      "datasource": "Prometheus",
+      "lines": true,
+      "linewidth": 1,
+      "targets": [
+        {
+          "expr": "kafka_consumer_lag",
+          "legendFormat": "{{group}}",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        { "format": "none", "logBase": 1, "min": 0 },
+        { "format": "short", "logBase": 1 }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Consumer Lag (total)",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 4 },
+      "datasource": "Prometheus",
+      "lines": true,
+      "linewidth": 1,
+      "targets": [
+        {
+          "expr": "sum(kafka_consumer_lag)",
+          "legendFormat": "total lag",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        { "format": "none", "logBase": 1, "min": 0 },
+        { "format": "short", "logBase": 1 }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Consumer groups lag table",
+      "id": 4,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "kafka_consumer_lag",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}
+EOF
+
+
+Часть 5: Запуск и настройка стека мониторинга
+Шаг 5.1: Запуск Docker Compose
+# Запускаем стек мониторинга
+cd ~/kafka-monitoring
+docker compose up -d
+
+# Проверяем статус контейнеров
+docker compose ps
+
+# Просматриваем логи
+docker compose logs -f --tail=50
+
+Шаг 5.2: Проверка доступности компонентов
+# Проверяем Prometheus
+curl -s http://localhost:9090/api/v1/status/config | jq .status
+
+# Проверяем Alertmanager
+curl -s http://localhost:9093/api/v1/status
+
+# Проверяем Grafana
+curl -s http://localhost:3000/api/health
+
+# Проверяем kafka-exporter
+curl -s http://localhost:9308/metrics | grep -E "(kafka_consumer_lag|kafka_brokers)" | head -5
+
+Шаг 5.3: Настройка Grafana
+# Открываем Grafana в браузере: http://10.0.2.30:3000
+# Логин: admin, пароль: admin123
+
+# 1. Проверяем, что источник данных Prometheus добавлен
+# 2. Импортируем дашборды через веб-интерфейс:
+#    - Нажимаем "+" -> Import
+#    - Загружаем файлы из ~/kafka-monitoring/grafana/dashboards/
+
+Часть 6: Тестирование мониторинга и алертов
+Шаг 6.1: Тестирование сбора метрик
+# 1. Проверяем метрики в Prometheus
+echo "=== Доступные метрики Kafka ==="
+curl -s "http://localhost:9090/api/v1/label/__name__/values" | jq -r '.data[]' | grep -i kafka | head -20
+
+# 2. Проверяем метрики consumer lag
+echo "=== Метрики Consumer Lag ==="
+curl -s "http://localhost:9090/api/v1/query?query=kafka_consumer_lag" | jq .
+
+# 3. Проверяем состояние алертов
+echo "=== Активные алерты ==="
+curl -s "http://localhost:9090/api/v1/alerts" | jq .
+
+Шаг 6.2: Создание тестовой нагрузки для проверки алертов
+# На kafka1 создаем тестовый топик и генерируем данные
+ssh kafka1
+
+# Создаем тестовый топик
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic test-monitoring \
+  --partitions 3 \
+  --replication-factor 2 \
+  --bootstrap-server localhost:9092
+
+# Запускаем producer для генерации данных
+/opt/kafka/bin/kafka-producer-perf-test.sh \
+  --topic test-monitoring \
+  --num-records 10000 \
+  --record-size 1000 \
+  --throughput 1000 \
+  --producer-props bootstrap.servers=localhost:9092
+
+# В другом терминале запускаем медленного consumer
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic test-monitoring \
+  --bootstrap-server localhost:9092 \
+  --group test-monitoring-group \
+  --max-messages 100 \
+  --timeout-ms 60000
+
+# Проверяем метрики lag через kafka-exporter
+curl -s http://localhost:9308/metrics | grep "test-monitoring-group"
+
+Шаг 6.3: Мониторинг алертов в Alertmanager
+# Проверяем алерты в Alertmanager
+curl -s http://localhost:9093/api/v1/alerts | jq .
+
+# Создаем тестовый алерт
+cat > test-alert.json << 'EOF'
+[
+  {
+    "labels": {
+      "alertname": "TestAlert",
+      "severity": "warning",
+      "instance": "test-instance"
+    },
+    "annotations": {
+      "summary": "Тестовый алерт",
+      "description": "Это тестовый алерт для проверки системы"
+    }
+  }
+]
+EOF
+
+# Отправляем тестовый алерт
+curl -X POST -H "Content-Type: application/json" \
+  --data @test-alert.json \
+  http://localhost:9093/api/v1/alerts
+
+Часть 7: Очистка и завершение работы
+Шаг 7.1: Команды для остановки мониторинга
+# Останавливаем стек мониторинга
+docker compose down
+
+# Удаляем тома (при необходимости)
+docker compose down -v
+
+# Останавливаем Node Exporter на нодах Kafka
+for node in kafka1 kafka2 kafka3; do
+    ssh $node "sudo systemctl stop node-exporter"
+done
+
+Резюме лабораторной работы
+В этой лабораторной работе вы настроили комплексную систему мониторинга для кластера Apache Kafka. Вы научились:
+- Развертывать стек мониторинга (Prometheus, Alertmanager, Grafana) с использованием Docker Compose
+- Настраивать сбор метрик с Kafka через kafka-exporter
+- Мониторить системные метрики с помощью Node Exporter
+- Создавать алерты на критические события (consumer lag, недоступность брокеров, проблемы с ресурсами)
+- Визуализировать метрики через готовые и кастомные дашборды Grafana
+- Тестировать и валидировать систему мониторинга
+
+Полученная система позволяет:
+- В реальном времени отслеживать состояние кластера Kafka
+- Заблаговременно обнаруживать проблемы через алерты
+- Анализировать производительность и выявлять узкие места
+- Мониторить consumer lag, что критически важно для data pipeline
+
+Эта система мониторинга является производственного уровня и может быть расширена для мониторинга всего стека данных в организации.
