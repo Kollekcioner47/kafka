@@ -371,15 +371,17 @@ mkdir -p opensearch-lab/data
 
 подготовленный Docker Compose
 cat > /home/engineer/opensearch-lab/docker-compose.yml << 'EOF'
-version: '3.8'
 services:
   opensearch:
     image: opensearchproject/opensearch:2.13.0
     container_name: opensearch
     environment:
       - discovery.type=single-node
-      - DISABLE_SECURITY_PLUGIN=true
+     # - DISABLE_SECURITY_PLUGIN=true
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - plugins.security.ssl.http.enabled=false
+      - plugins.security.allow_default_init_securityindex=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=C@nsole47
     ports:
       - "9200:9200"
       - "9600:9600"
@@ -463,4 +465,5 @@ curl -X POST "http://10.0.2.30:9200/test-index/_doc/1" -H 'Content-Type: applica
 }'
 
 # Поиск
+
 curl -X GET "http://10.0.2.30:9200/test-index/_search?pretty"
