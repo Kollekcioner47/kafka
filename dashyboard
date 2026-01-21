@@ -1,0 +1,19 @@
+# Создаем визуализацию "Orders by Status"
+cat > /tmp/orders_by_status_vis.json << 'EOF'
+{
+  "visState": "{\"title\":\"Orders by Status\",\"type\":\"pie\",\"params\":{\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"status.keyword\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}]}",
+  "title": "Orders by Status",
+  "uiStateJSON": "{}",
+  "description": "",
+  "version": 1,
+  "kibanaSavedObjectMeta": {
+    "searchSourceJSON": "{\"index\":\"postgres-server.public.orders\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+  }
+}
+EOF
+
+# Отправляем через API Dashboards
+curl -X POST "http://10.0.2.30:5601/api/saved_objects/visualization/orders-by-status" \
+  -H "kbn-xsrf: true" \
+  -H "Content-Type: application/json" \
+  -d @/tmp/orders_by_status_vis.json
