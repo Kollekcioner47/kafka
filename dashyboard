@@ -13,14 +13,8 @@ cat > /tmp/orders_by_status_vis.json << 'EOF'
 EOF
 
 # Отправляем через API Dashboards
+# С заголовком osd-xsrf
 curl -X POST "http://10.0.2.30:5601/api/saved_objects/visualization/orders-by-status" \
-  -H "kbn-xsrf: true" \
+  -H "osd-xsrf: true" \
   -H "Content-Type: application/json" \
   -d @/tmp/orders_by_status_vis.json
-
-
-curl -X POST "http://10.0.2.30:5601/api/saved_objects/visualization/orders-by-status" \
-  -H "kbn-xsrf: true" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/orders_by_status_vis.json
-{"statusCode":400,"error":"Bad Request","message":"Request must contain the osd-xsrf header."}
