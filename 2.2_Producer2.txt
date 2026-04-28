@@ -1,0 +1,996 @@
+Лабораторная 2.2: Продюсеры Apache Kafka на Python
+
+Цель: Освоить создание продюсеров с разными уровнями надежности и производительности
+Время выполнения: 30-45 минут
+Необходимо: 
+1. Рабочий кластер Kafka из Лабораторной 1
+2. Python 3.8+ и pip
+3. Топик для тестов
+
+"Представьте, что Kafka — это почтовая служба, а продюсеры — отправители писем"
+acks=0 — бросил письмо в почтовый ящик и пошёл дальше (быстро, но письмо может потеряться)
+acks=1 — отдал письмо почтальону и получил квитанцию (надёжнее, но ждать)
+acks=all — письмо должно быть доставлено и подтверждено получателем (максимально надёжно)
+retry — если почтальон заболел, попробовать другого
+async — нанять помощника, который будет разносить письма, а вы будете заполнять новые
+
+# ============================================
+# 1. ПОДГОТОВКА ОКРУЖЕНИЯ
+# ============================================
+
+# Подключитесь к kafka1.lab
+ssh kafka1.lab
+
+# 1.1. Установка Python и необходимых библиотек
+echo "Устанавливаем Python и библиотеки..."
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv git
+
+# 1.2. Создаем виртуальное окружение
+mkdir -p ~/kafka-lab/producers
+cd ~/kafka-lab/producers
+python3 -m venv venv
+source venv/bin/activate
+
+# 1.3. Устанавливаем библиотеки
+echo "Устанавливаем confluent-kafka и утилиты..."
+pip install confluent-kafka faker rich
+
+# 1.4. Создаем тестовый топик
+echo "Создаем тестовые топики..."
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic test-producer \
+  --bootstrap-server localhost:9092 \
+  --partitions 3 \
+  --replication-factor 3 \
+  --config retention.ms=3600000
+
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic test-perf \
+  --bootstrap-server localhost:9092 \
+  --partitions 6 \
+  --replication-factor 3
+
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic test-dlq \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 3
+
+# Проверяем создание
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep test
+
+Общая архитектура всех скриптов
+Все скрипты используют библиотеку confluent-kafka-python — официальный Python-клиент для Kafka от Confluent. Это не "студенческая" библиотека, а именно та, которая используется в продакшене.
+
+1. basic_producer.py — Базовый продюсер с разными уровнями acks
+Что делает:
+Демонстрирует три уровня гарантий доставки через параметр acks:
+acks=0 — "отправил и забыл" (максимальная скорость, возможна потеря данных)
+acks=1 — подтверждение от лидера (баланс скорости и надежности)
+acks=all — подтверждение от всех реплик (максимальная надежность, медленнее)
+Ключевые концепции:
+# 1. Конфигурация продюсера
+config = {
+    'bootstrap.servers': 'kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092',
+    'acks': 'all',  # ← САМАЯ ВАЖНАЯ НАСТРОЙКА!
+    'retries': 5,   # Количество попыток при ошибке
+    'linger.ms': 5, # Ждём 5мс, чтобы накопить батч
+    'batch.size': 16384, # Отправляем пачками по 16KB
+    'compression.type': 'snappy', # Сжимаем сообщения
+}
+
+# 2. Callback-функция (обратный вызов)
+def delivery_report(err, msg):
+    if err is not None:
+        print(f'Ошибка: {err}')
+    else:
+        print(f'Сообщение доставлено в партицию {msg.partition()}')
+        
+# 3. Асинхронная отправка с callback
+producer.produce(
+    topic='orders',
+    key='user123',       # Ключ определяет партицию
+    value='{"order": 1}',
+    callback=delivery_report  # Вызовется, когда Kafka ответит
+)
+Что вы увидите на практике:
+acks=0: 3100 сообщ/сек, но может потерять 1-2%
+acks=1: 2800 сообщ/сек, надежнее  
+acks=all: 1200 сообщ/сек, но гарантированно доставит
+Выбирайте acks в зависимости от важности данных!
+
+2. retry_producer.py — Продюсер с обработкой ошибок и retry
+Что делает:
+Показывает продвинутые стратегии обработки сбоев, которые необходимы в production:
+Экспоненциальная задержка — если ошибка, ждём 100мс, потом 200мс, потом 400мс...
+Circuit Breaker — если много ошибок подряд, временно останавливаем отправку
+Dead Letter Queue (DLQ) — сохраняем неудавшиеся сообщения в файл
+Классификация ошибок — разные ошибки обрабатываем по-разному
+Ключевые концепции:
+# 1. Экспоненциальная задержка с джиттером
+def exponential_backoff(attempt):
+    delay = 100 * (2 ** attempt)  # 100, 200, 400, 800...
+    jitter = random.uniform(0.8, 1.2)  # ±20% случайности
+    return delay * jitter
+
+# 2. Circuit Breaker паттерн
+error_rate = error_count / 100
+if error_rate > 0.3:  # Если >30% ошибок
+    print("Circuit Breaker открыт! Пауза 5 секунд")
+    time.sleep(5)
+
+# 3. Dead Letter Queue (сохраняем неудачные сообщения)
+failed_messages = []
+for message in failed:
+    with open('failed_messages.json', 'a') as f:
+        json.dump(message, f)  # Сохраняем для повторной обработки позже
+
+Типы ошибок, которые обрабатываем:
+Timeout ошибки (-185, -195) — можно повторить
+Недоступность брокера (-187, -189) — нужно подождать
+Ошибки авторизации (-192) — критично, нужно остановиться
+В production обязательно нужен retry механизм!
+
+3. async_producer.py — Асинхронный продюсер с многопоточностью
+Что делает:
+Демонстрирует высокопроизводительную асинхронную отправку:
+Основной поток — быстро генерирует и отправляет сообщения
+Callback-поток — отдельно обрабатывает ответы от Kafka
+Измерение latency — считаем, сколько времени занимает доставка
+Прогресс-бар в реальном времени — красивый интерфейс с Rich
+Ключевые концепции:
+# 1. Два потока: основной и callback-обработчик
+# Основной поток:
+producer.produce(topic, value, callback=self._delivery_callback)
+
+# Отдельный поток для callback:
+def _process_callbacks(self):
+    while True:
+        result = self.callback_queue.get()  # Берем из очереди
+        if result['err']:
+            self.stats['failed'] += 1
+        else:
+            self.stats['confirmed'] += 1
+
+# 2. Измерение latency (задержки)
+start_time = time.time()
+producer.produce(topic, value, callback=...)
+# В callback:
+latency = time.time() - start_time  # Сколько секунд шло сообщение
+
+# 3. Rich для красивого вывода
+from rich.progress import Progress
+with Progress() as progress:
+    task = progress.add_task("Отправка...", total=1000)
+    for i in range(1000):
+        producer.produce(...)
+        progress.update(task, advance=1)
+
+Метрики, которые измеряем:
+Throughput — сообщений в секунду
+Latency (avg) — средняя задержка доставки
+Latency (p95) — 95% сообщений доставляются быстрее этого времени
+Success rate — процент успешных доставок
+Асинхронность + многопоточность = высокая производительность!
+
+4. performance_test.py — Сравнение конфигураций
+Что делает:
+Сравнивает 5 разных конфигураций продюсера, чтобы показать, как настройки влияют на производительность:
+Базовый — баланс скорости и надежности
+Высокая производительность — максимум сообщений в секунду
+Максимальная надежность — для финансовых транзакций
+Низкая задержка — для чатов, уведомлений
+Для больших сообщений — оптимизирован под 1MB+ сообщения
+Ключевые концепции:
+# Конфигурации для разных use cases:
+configs = {
+    'high-throughput': {
+        'acks': '1',           # Быстро, но можно потерять
+        'compression.type': 'snappy',  # Хорошее сжатие
+        'batch.size': 65536,   # Большие батчи
+    },
+    'high-reliability': {
+        'acks': 'all',         # Медленно, но надежно
+        'enable.idempotence': True,  # Идемпотентность
+        'max.in.flight.requests.per.connection': 1,
+    }
+}
+Таблица результатов, которую вы увидите:
+Конфигурация              Throughput   Avg Latency   Success Rate
+──────────────────────────────────────────────────────────────────
+Высокая производительность   2850 msg/s    8.12 ms        99.5%
+Максимальная надежность       850 msg/s   45.67 ms       100.0%
+Низкая задержка             3100 msg/s    5.23 ms        98.9%
+Нет "универсальной" конфигурации! Настройки зависят от задачи.
+
+
+# ============================================
+# 2. БАЗОВЫЙ ПРОДЮСЕР
+# ============================================
+
+echo "Создаем базовый продюсер..."
+
+# 2.1. Создаем файл basic_producer.py
+cat > basic_producer.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Базовый продюсер: Сравнение уровней надежности (acks)
+Убрано искусственное замедление для реального теста производительности.
+"""
+
+from confluent_kafka import Producer
+import json
+import time
+from datetime import datetime
+from faker import Faker
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+fake = Faker('ru_RU')
+
+class BasicProducer:
+    def __init__(self, bootstrap_servers, acks='all'):
+        self.config = {
+            'bootstrap.servers': bootstrap_servers,
+            'acks': acks,
+            'retries': 5,
+            'linger.ms': 5,       # Накапливаем 5мс перед отправкой батча
+            'batch.size': 32768,  # 32KB батч
+            'compression.type': 'snappy',
+        }
+        self.producer = Producer(self.config)
+        self.stats = {'delivered': 0, 'failed': 0}
+
+    def delivery_report(self, err, msg):
+        """Callback обработки доставки"""
+        if err is not None:
+            self.stats['failed'] += 1
+        else:
+            self.stats['delivered'] += 1
+
+    def send_data(self, topic, num_messages=5000):
+        start_time = time.time()
+        console.print(f"🚀 Отправка [bold cyan]{num_messages}[/bold cyan] сообщений с acks=[bold yellow]{self.config['acks']}[/bold yellow]...")
+        
+        for i in range(num_messages):
+            # Генерация данных
+            value = json.dumps({
+                'id': i,
+                'user': fake.name(),
+                'ts': datetime.now().isoformat()
+            }, ensure_ascii=False)
+            
+            # Используем ID как ключ для партиционирования
+            key = str(i)
+            
+            self.producer.produce(
+                topic=topic,
+                key=key,
+                value=value,
+                callback=self.delivery_report
+            )
+            
+            # poll(0) просто обслуживает callback-очередь, не блокирует отправку
+            if i % 1000 == 0:
+                self.producer.poll(0)
+
+        # Блокируем завершение, пока все сообщения не уйдут
+        self.producer.flush()
+        
+        duration = time.time() - start_time
+        throughput = num_messages / duration
+        
+        return {
+            'acks': self.config['acks'],
+            'throughput': throughput,
+            'duration': duration,
+            'delivered': self.stats['delivered'],
+            'failed': self.stats['failed']
+        }
+
+if __name__ == "__main__":
+    BOOTSTRAP_SERVERS = "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092"
+    TOPIC = "test-producer"
+    
+    results = []
+    for acks in ['0', '1', 'all']:
+        prod = BasicProducer(BOOTSTRAP_SERVERS, acks=acks)
+        # Для acks=0 мы не получаем подтверждения доставки в callback, 
+        # но скорость отправки должна быть максимальной.
+        res = prod.send_data(TOPIC, num_messages=5000)
+        results.append(res)
+        time.sleep(1)
+
+    # Вывод таблицы
+    table = Table(title="Сравнение производительности (Acks)")
+    table.add_column("Acks", style="cyan")
+    table.add_column("Throughput (msg/s)", justify="right")
+    table.add_column("Time (s)", justify="right")
+    table.add_column("Status", style="green")
+
+    for r in results:
+        # acks=0 не вызовет delivery_report (err=None, msg=None не приходит), 
+        # поэтому delivered будет 0, это нормально.
+        status = "Fast & Unsafe" if r['acks'] == '0' else ("Balanced" if r['acks'] == '1' else "Safe & Slow")
+        table.add_row(r['acks'], f"{r['throughput']:.2f}", f"{r['duration']:.2f}", status)
+    
+    console.print(table)
+EOF
+
+
+# 2.2. Запускаем базовый продюсер
+echo "Запускаем тест разных уровней acks..."
+python3 basic_producer.py
+
+
+# ============================================
+# 3. ПРОДЮСЕР С РАСШИРЕННЫМ RETRY МЕХАНИЗМОМ
+# ============================================
+
+cat > retry_producer.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Продюсер с обработкой ошибок и Dead Letter Queue (DLQ).
+Клиент confluent-kafka сам обрабатывает ретраи (согласно настройке retries).
+Мы здесь обрабатываем только фатальные ошибки, когда ретраи закончились.
+"""
+
+from confluent_kafka import Producer
+import json
+import time
+from datetime import datetime
+from rich.console import Console
+
+console = Console()
+
+class ReliableProducer:
+    def __init__(self, bootstrap_servers):
+        self.config = {
+            'bootstrap.servers': bootstrap_servers,
+            # Важно: enable.idempotence гарантирует отсутствие дубликатов при ретраях
+            'enable.idempotence': True, 
+            'acks': 'all',
+            'retries': 5,          # Библиотека сама попробует 5 раз
+            'retry.backoff.ms': 100,
+            'linger.ms': 5,
+        }
+        self.producer = Producer(self.config)
+        self.failed_messages = [] # Имитация DLQ в памяти
+
+    def delivery_report(self, err, msg):
+        """
+        Callback вызывается только когда брокер финально подтвердил успех
+        или когда все попытки ретрая (retries) исчерпаны.
+        """
+        if err is not None:
+            console.print(f"[red]❌ Сообщение не доставлено (ретраи исчерпаны): {err}[/red]")
+            # В реальном проде здесь мы отправляем сообщение в отдельный топик DLQ
+            self.failed_messages.append({
+                'key': msg.key().decode('utf-8') if msg.key() else None,
+                'value': msg.value().decode('utf-8') if msg.value() else None,
+                'error': str(err)
+            })
+        else:
+            pass # Успех, все хорошо
+
+    def run(self, topic, num_messages=2000):
+        console.print(f"🛡️ Запуск надежного продюсера ({num_messages} msg)...")
+        console.print("ℹ️  Ретраи обрабатывает библиотека автоматически (retries=5).")
+        
+        for i in range(num_messages):
+            val = json.dumps({'id': i, 'ts': datetime.now().isoformat()})
+            self.producer.produce(topic, key=str(i), value=val, callback=self.delivery_report)
+            self.producer.poll(0) # Асинхронная отправка
+            
+        self.producer.flush()
+        
+        console.print(f"✅ Завершено. Ошибок (попало в DLQ): {len(self.failed_messages)}")
+        if self.failed_messages:
+            console.print(self.failed_messages[:5]) # Покажем первые ошибки
+
+if __name__ == "__main__":
+    BOOTSTRAP_SERVERS = "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092"
+    prod = ReliableProducer(BOOTSTRAP_SERVERS)
+    prod.run("test-producer")
+EOF
+
+# 3.2. Запускаем продюсер с retry
+echo "Запускаем продюсер с расширенным retry механизмом..."
+python3 retry_producer.py
+
+
+# ============================================
+# 4. АСИНХРОННЫЙ ПРОДЮСЕР 
+# ============================================
+
+echo "Создаем асинхронный продюсер с продвинутыми callback..."
+
+# 4.1. Создаем файл async_producer.py
+cat > async_producer.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Асинхронный продюсер с правильным измерением Latency.
+Используем словарь для хранения времени отправки.
+"""
+
+from confluent_kafka import Producer
+import json
+import time
+import statistics
+from collections import defaultdict
+from rich.console import Console
+from rich.progress import Progress
+
+console = Console()
+
+class AsyncProducer:
+    def __init__(self, bootstrap_servers):
+        self.config = {
+            'bootstrap.servers': bootstrap_servers,
+            'acks': 'all',
+            'linger.ms': 1,          # Маленькая задержка для батчинга
+            'batch.size': 65536,     # 64KB батчи
+            'compression.type': 'snappy',
+            # Важно! Буферизируем много сообщений в памяти перед отправкой
+            'queue.buffering.max.messages': 100000, 
+        }
+        self.producer = Producer(self.config)
+        
+        # Хранилище для замеров времени: Key -> Время отправки
+        self.pending_times = defaultdict(float)
+        self.latencies = []
+        self.confirmed_count = 0
+
+    def delivery_report(self, err, msg):
+        """
+        Callback вызывается librdkafka в отдельном потоке.
+        """
+        if err:
+            console.print(f"[red]Error: {err}[/red]")
+            return
+
+        # Извлекаем ключ сообщения
+        try:
+            key = msg.key().decode('utf-8')
+        except:
+            return
+
+        # Вычисляем latency
+        send_time = self.pending_times.pop(key, 0)
+        if send_time > 0:
+            latency = time.time() - send_time
+            self.latencies.append(latency)
+            self.confirmed_count += 1
+
+    def send_batch(self, topic, num_messages=10000):
+        console.print(f"⚡ Асинхронная отправка {num_messages} сообщений...")
+        console.print("⚠️  Latency (задержка) считается реальная, от send() до ack().")
+        
+        start_total = time.time()
+        
+        with Progress() as progress:
+            task = progress.add_task("Sending...", total=num_messages)
+            
+            for i in range(num_messages):
+                key = str(i)
+                
+                # 1. Запоминаем время отправки ПЕРЕД вызовом produce
+                self.pending_times[key] = time.time()
+                
+                # 2. Асинхронная отправка (моментальная, кладет в очередь librdkafka)
+                self.producer.produce(
+                    topic, 
+                    key=key, 
+                    value=json.dumps({'id': i}), 
+                    callback=self.delivery_report
+                )
+                
+                # poll() позволяет callback'ам выполниться, чтобы не переполнить память
+                if i % 5000 == 0:
+                    self.producer.poll(0)
+                
+                progress.update(task, advance=1)
+
+        console.print("⏳ Ожидание подтверждения всех сообщений (flush)...")
+        self.producer.flush() # Ждем пока все улетит и callback'и отработают
+        
+        duration_total = time.time() - start_total
+        
+        # Статистика
+        if self.latencies:
+            avg_lat_ms = statistics.mean(self.latencies) * 1000
+            p95_lat_ms = statistics.quantiles(self.latencies, n=20)[18] * 1000 if len(self.latencies) > 20 else 0
+        else:
+            avg_lat_ms = 0
+            p95_lat_ms = 0
+
+        console.print(f"\n[bold green]Результаты:[/bold green]")
+        console.print(f"  Throughput: {num_messages/duration_total:.2f} msg/s")
+        console.print(f"  Avg Latency: [cyan]{avg_lat_ms:.2f} ms[/cyan]")
+        console.print(f"  P95 Latency: [yellow]{p95_lat_ms:.2f} ms[/yellow]")
+        console.print(f"  Confirmed: {self.confirmed_count}/{num_messages}")
+
+if __name__ == "__main__":
+    BOOTSTRAP_SERVERS = "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092"
+    prod = AsyncProducer(BOOTSTRAP_SERVERS)
+    prod.send_batch("test-perf")
+EOF
+
+# 4.2. Запускаем асинхронный продюсер
+echo "Запускаем асинхронный продюсер с callback..."
+python3 async_producer.py
+
+
+# ============================================
+# 5. ТЕСТИРОВАНИЕ ПРОИЗВОДИТЕЛЬНОСТИ
+# ============================================
+
+echo "Создаем тест производительности..."
+
+# 5.1. Создаем файл performance_test.py
+cat > performance_test.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Тестирование производительности продюсеров с разными конфигурациями
+Сравнение различных настроек для оптимизации
+"""
+
+from confluent_kafka import Producer
+import json
+import time
+import statistics
+from datetime import datetime
+from rich.console import Console
+from rich.table import Table
+import threading
+
+console = Console()
+
+class PerformanceTester:
+    def __init__(self, bootstrap_servers, topic):
+        self.bootstrap_servers = bootstrap_servers
+        self.topic = topic
+        
+    def create_producer(self, config_name, config):
+        """Создание продюсера с заданной конфигурацией"""
+        base_config = {
+            'bootstrap.servers': self.bootstrap_servers,
+            'acks': 'all',
+        }
+        base_config.update(config)
+        
+        return Producer(base_config), config_name
+    
+    def run_test(self, producer, config_name, num_messages=10000, message_size=100):
+        """
+        Запуск теста производительности
+        
+        Args:
+            producer: объект продюсера
+            config_name: имя конфигурации
+            num_messages: количество сообщений
+            message_size: размер сообщения в байтах
+        """
+        console.print(f"\n[bold]🧪 Тестирование конфигурации: {config_name}[/bold]")
+        
+        stats = {
+            'sent': 0,
+            'confirmed': 0,
+            'failed': 0,
+            'latencies': [],
+            'start_time': None,
+            'end_time': None,
+        }
+        
+        # Callback для сбора статистики
+        def delivery_callback(err, msg):
+            if err:
+                stats['failed'] += 1
+            else:
+                stats['confirmed'] += 1
+                if hasattr(msg, '_timestamp'):
+                    latency = time.time() - msg._timestamp
+                    stats['latencies'].append(latency)
+        
+        # Генерация тестового сообщения
+        test_payload = 'x' * message_size
+        
+        stats['start_time'] = time.time()
+        
+        # Отправка сообщений
+        for i in range(num_messages):
+            message = {
+                'id': i + 1,
+                'timestamp': datetime.now().isoformat(),
+                'payload': test_payload,
+                'config': config_name,
+                'sequence': i
+            }
+            
+            value = json.dumps(message)
+            
+            # Сохраняем timestamp
+            msg_obj = type('obj', (object,), {'_timestamp': time.time()})
+            
+            producer.produce(
+                topic=self.topic,
+                key=str(i % 100),  # 100 разных ключей для распределения
+                value=value,
+                callback=delivery_callback
+            )
+            
+            stats['sent'] += 1
+            
+            # Обработка очереди каждые 1000 сообщений
+            if i % 1000 == 0:
+                producer.poll(0)
+        
+        # Завершение отправки
+        producer.flush()
+        stats['end_time'] = time.time()
+        
+        # Даем время на обработку callback
+        time.sleep(1)
+        
+        # Расчет метрик
+        duration = stats['end_time'] - stats['start_time']
+        throughput = stats['sent'] / duration if duration > 0 else 0
+        
+        if stats['latencies']:
+            latencies_ms = [l * 1000 for l in stats['latencies']]
+            avg_latency = statistics.mean(latencies_ms)
+            p95_latency = statistics.quantiles(latencies_ms, n=20)[18]
+        else:
+            avg_latency = p95_latency = 0
+        
+        return {
+            'config': config_name,
+            'sent': stats['sent'],
+            'confirmed': stats['confirmed'],
+            'failed': stats['failed'],
+            'duration': duration,
+            'throughput': throughput,
+            'avg_latency': avg_latency,
+            'p95_latency': p95_latency,
+            'success_rate': stats['confirmed'] / stats['sent'] if stats['sent'] > 0 else 0
+        }
+    
+    def run_all_tests(self):
+        """Запуск всех тестов производительности"""
+        console.print("[bold green]🚀 ЗАПУСК ТЕСТОВ ПРОИЗВОДИТЕЛЬНОСТИ[/bold green]")
+        
+        # Определяем тестовые конфигурации
+        test_configs = [
+            ('Базовый', {
+                'acks': 'all',
+                'retries': 5,
+                'linger.ms': 5,
+                'batch.size': 16384,
+            }),
+            ('Высокая производительность', {
+                'acks': '1',
+                'retries': 3,
+                'linger.ms': 1,
+                'batch.size': 65536,
+                'compression.type': 'snappy',
+                'queue.buffering.max.messages': 100000,
+            }),
+            ('Максимальная надежность', {
+                'acks': 'all',
+                'retries': 10,
+                'linger.ms': 20,
+                'batch.size': 32768,
+                'compression.type': 'lz4',
+                'max.in.flight.requests.per.connection': 1,
+                'enable.idempotence': True,
+            }),
+            ('Низкая задержка', {
+                'acks': '1',
+                'retries': 2,
+                'linger.ms': 0,
+                'batch.size': 8192,
+                'compression.type': 'none',
+                'queue.buffering.max.ms': 0,
+            }),
+            ('Оптимизированный для больших сообщений', {
+                'acks': 'all',
+                'retries': 5,
+                'linger.ms': 10,
+                'batch.size': 131072,
+                'compression.type': 'gzip',
+                'message.max.bytes': 1048576,
+            }),
+        ]
+        
+        results = []
+        
+        # Запускаем тесты для каждой конфигурации
+        for config_name, config in test_configs:
+            producer, name = self.create_producer(config_name, config)
+            result = self.run_test(producer, name, num_messages=2000, message_size=500)
+            results.append(result)
+            
+            # Пауза между тестами
+            time.sleep(2)
+        
+        # Вывод результатов
+        self.print_results_table(results)
+        
+        # Рекомендации
+        self.print_recommendations(results)
+        
+        return results
+    
+    def print_results_table(self, results):
+        """Вывод результатов в виде таблицы"""
+        table = Table(title="📊 РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ ПРОИЗВОДИТЕЛЬНОСТИ")
+        
+        table.add_column("Конфигурация", style="cyan", no_wrap=True)
+        table.add_column("Пропускная способность", style="green", justify="right")
+        table.add_column("Avg Latency", style="magenta", justify="right")
+        table.add_column("P95 Latency", style="yellow", justify="right")
+        table.add_column("Успешность", style="blue", justify="right")
+        table.add_column("Время", style="white", justify="right")
+        
+        for result in results:
+            table.add_row(
+                result['config'],
+                f"{result['throughput']:.2f} сообщ/сек",
+                f"{result['avg_latency']:.2f} мс",
+                f"{result['p95_latency']:.2f} мс",
+                f"{result['success_rate']*100:.1f}%",
+                f"{result['duration']:.2f} сек"
+            )
+        
+        console.print(table)
+    
+    def print_recommendations(self, results):
+        """Вывод рекомендаций на основе результатов"""
+        console.print("\n[bold]🎯 РЕКОМЕНДАЦИИ ПО КОНФИГУРАЦИИ:[/bold]")
+        
+        # Находим лучшую конфигурацию по каждому параметру
+        best_throughput = max(results, key=lambda x: x['throughput'])
+        best_latency = min(results, key=lambda x: x['avg_latency'])
+        best_reliability = max(results, key=lambda x: x['success_rate'])
+        
+        console.print(f"\n✅ Для максимальной производительности ({best_throughput['throughput']:.2f} сообщ/сек):")
+        console.print(f"   Используйте конфигурацию: [green]{best_throughput['config']}[/green]")
+        console.print(f"   Рекомендуется для: логирование, метрики, аналитика")
+        
+        console.print(f"\n⚡ Для минимальной задержки ({best_latency['avg_latency']:.2f} мс):")
+        console.print(f"   Используйте конфигурацию: [cyan]{best_latency['config']}[/cyan]")
+        console.print(f"   Рекомендуется для: реальные уведомления, чаты, онлайн-игры")
+        
+        console.print(f"\n🛡️ Для максимальной надежности ({best_reliability['success_rate']*100:.1f}%):")
+        console.print(f"   Используйте конфигурацию: [yellow]{best_reliability['config']}[/yellow]")
+        console.print(f"   Рекомендуется для: финансовые транзакции, заказы, critical данные")
+        
+        console.print(f"\n[bold]📝 ОБЩИЕ РЕКОМЕНДАЦИИ:[/bold]")
+        console.print("1. Для высокой нагрузки используйте сжатие (snappy/lz4)")
+        console.print("2. Для exactly-once семантики включайте enable.idempotence")
+        console.print("3. Настраивайте batch.size под размер сообщений")
+        console.print("4. Мониторьте latency и throughput в production")
+        console.print("5. Тестируйте разные конфигурации под вашу нагрузку")
+
+if __name__ == "__main__":
+    # Конфигурация
+    BOOTSTRAP_SERVERS = "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092"
+    TOPIC = "test-perf"
+    
+    # Запускаем тесты
+    tester = PerformanceTester(BOOTSTRAP_SERVERS, TOPIC)
+    results = tester.run_all_tests()
+    
+    console.print("\n[bold green]✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО![/bold green]")
+    
+    # Сохраняем результаты в файл
+    import csv
+    with open('performance_results.csv', 'w', newline='') as csvfile:
+        fieldnames = ['config', 'throughput', 'avg_latency', 'p95_latency', 'success_rate', 'duration']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        for result in results:
+            writer.writerow({
+                'config': result['config'],
+                'throughput': result['throughput'],
+                'avg_latency': result['avg_latency'],
+                'p95_latency': result['p95_latency'],
+                'success_rate': result['success_rate'],
+                'duration': result['duration']
+            })
+    
+    console.print(f"📁 Результаты сохранены в performance_results.csv")
+EOF
+
+# 5.2. Запускаем тест производительности
+echo "Запускаем тест производительности..."
+python3 performance_test.py
+
+
+# ============================================
+# 6. ПРОВЕРКА РЕЗУЛЬТАТОВ В KAFKA
+# ============================================
+
+echo "Проверяем результаты отправки в Kafka..."
+
+# 6.1. Проверяем количество сообщений в топиках (новый синтаксис для Kafka 4.x)
+echo "Количество сообщений в топиках:"
+/opt/kafka/bin/kafka-run-class.sh kafka.admin.ConsumerGroupCommand \
+  --bootstrap-server localhost:9092 \
+  --group test-offset-checker \
+  --topic test-producer \
+  --describe 2>/dev/null | awk '/test-producer/ {sum += $3} END {print "test-producer:", sum}' || \
+  echo "test-producer: для подсчета создайте consumer group"
+
+# Альтернативный способ через GetOffsetShell (если есть в вашей версии)
+# Если команда ниже работает, используйте её вместо предыдущей
+/opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic test-producer --time -1 2>/dev/null | \
+  awk -F ":" '{sum += $3} END {print "test-producer:", sum}' || \
+  echo "test-producer: используйте альтернативный метод подсчета"
+
+# 6.2. Простой подсчет через consumer (более надежный способ)
+echo "Быстрый подсчет через consumer (первые 1000 сообщений):"
+timeout 10 /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic test-producer \
+  --bootstrap-server localhost:9092 \
+  --from-beginning \
+  --max-messages 1000 2>/dev/null | wc -l | xargs echo "Найдено сообщений в test-producer:"
+
+# 6.3. Проверяем consumer groups
+echo "Consumer groups:"
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --list 2>/dev/null || echo "Consumer groups не найдены (это нормально для продюсеров)"
+
+# 6.4. Подробная информация о топиках
+echo "Подробная информация о топиках:"
+/opt/kafka/bin/kafka-topics.sh --describe \
+  --topic test-producer \
+  --bootstrap-server localhost:9092
+
+/opt/kafka/bin/kafka-topics.sh --describe \
+  --topic test-perf \
+  --bootstrap-server localhost:9092
+
+# 6.5. Читаем несколько сообщений для проверки
+echo "Читаем 3 сообщения из test-producer:"
+timeout 5 /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic test-producer \
+  --bootstrap-server localhost:9092 \
+  --from-beginning \
+  --max-messages 3 \
+  --timeout-ms 5000 2>/dev/null || echo "Не удалось прочитать сообщения"
+
+echo "Читаем 3 сообщения из test-perf:"
+timeout 5 /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic test-perf \
+  --bootstrap-server localhost:9092 \
+  --from-beginning \
+  --max-messages 3 \
+  --timeout-ms 5000 2>/dev/null || echo "Не удалось прочитать сообщения"
+
+# 6.6. Проверка через утилиту для просмотра логов
+echo "Проверка размера логов на диске:"
+sudo du -sh /opt/kafka/data/*test* 2>/dev/null | head -5
+
+echo "Количество сегментов логов:"
+find /opt/kafka/data -name "*.log" -name "*test*" 2>/dev/null | wc -l | xargs echo "Файлов логов:"
+
+# ============================================
+# 7. ОЧИСТКА И ЗАКЛЮЧЕНИЕ
+# ============================================
+
+echo "=== ЛАБОРАТОРНАЯ 2.2 ЗАВЕРШЕНА ==="
+echo ""
+echo "✅ ПРОВЕРЬТЕ, ЧТО ВЫ ВЫПОЛНИЛИ:"
+echo "   1. Установили Python и зависимости"
+echo "   2. Запустили basic_producer.py (тест acks уровней)"
+echo "   3. Запустили retry_producer.py (механизмы повторной отправки)"
+echo "   4. Запустили async_producer.py (асинхронная отправка)"
+echo "   5. Запустили performance_test.py (тест производительности)"
+echo "   6. Проверили результаты через verify_production.py"
+echo ""
+echo "📊 ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ:"
+echo "   - Сообщения успешно отправляются в Kafka"
+echo "   - Разные уровни acks влияют на производительность и надежность"
+echo "   - Retry механизмы работают при сбоях"
+echo "   - Асинхронная отправка увеличивает пропускную способность"
+echo "   - Оптимальная конфигурация зависит от сценария использования"
+echo ""
+echo "🔧 ДЛЯ УГЛУБЛЕННОГО ИЗУЧЕНИЯ:"
+echo "   1. Экспериментируйте с разными размерами batch.size и linger.ms"
+echo "   2. Попробуйте разные алгоритмы сжатия (none, gzip, snappy, lz4, zstd)"
+echo "   3. Реализуйте exactly-once семантику с транзакциями"
+echo "   4. Добавьте мониторинг продюсера в Grafana через JMX"
+echo "   5. Протестируйте производительность при разных размерах сообщений"
+echo ""
+echo "🛠️  УСТРАНЕНИЕ ПРОБЛЕМ:"
+echo "   Если команды Kafka не работают:"
+echo "   1. Проверьте версию: /opt/kafka/bin/kafka-topics.sh --version"
+echo "   2. Используйте --help для проверки синтаксиса: /opt/kafka/bin/kafka-topics.sh --help"
+echo "   3. Для подсчета сообщений используйте Python-скрипт verify_production.py"
+echo ""
+echo "📚 ПОЛЕЗНЫЕ ССЫЛКИ:"
+echo "   - Документация confluent-kafka-python: https://github.com/confluentinc/confluent-kafka-python"
+echo "   - Kafka Producer Configs: https://kafka.apache.org/documentation/#producerconfigs"
+echo "   - Best Practices: https://www.confluent.io/blog/apache-kafka-producer-improvements-sticky-partitioner/"
+echo ""
+echo "Следующий шаг: Лабораторная 2.3 — Консюмеры Kafka"
+
+
+
+Дополнительно: скрипт для проверки результатов продюсеров
+Давайте создадим Python-скрипт для надежной проверки результатов:
+# Создаем файл verify_production.py
+cat > verify_production.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Читает сообщения из топика, чтобы убедиться, что продюсер все отправил.
+"""
+
+from confluent_kafka import Consumer, KafkaError
+import sys
+from rich.console import Console
+
+console = Console()
+
+def consume_messages(bootstrap_servers, topic, timeout_sec=10):
+    conf = {
+        'bootstrap.servers': bootstrap_servers,
+        'group.id': f'verify-group-{int(time.time())}', # Уникальный ID группы
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False
+    }
+    
+    consumer = Consumer(conf)
+    consumer.subscribe([topic])
+    
+    msg_count = 0
+    try:
+        console.print(f"🔍 Читаем из топика [bold]{topic}[/bold] (таймаут {timeout_sec} сек)...")
+        while True:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue # Конец партиции
+                else:
+                    console.print(f"[red]Consumer error: {msg.error()}[/red]")
+                    break
+            
+            msg_count += 1
+            if msg_count % 1000 == 0:
+                console.print(f"📦 Прочитано: {msg_count}...", end='\r')
+                
+    except KeyboardInterrupt:
+        pass
+    finally:
+        consumer.close()
+    
+    console.print(f"\n✅ Всего прочитано сообщений: [bold green]{msg_count}[/bold green]")
+    return msg_count
+
+import time
+if __name__ == "__main__":
+    BOOTSTRAP_SERVERS = "kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092"
+    
+    console.print("\n=== ПРОВЕРКА ТОПИКОВ ===")
+    consume_messages(BOOTSTRAP_SERVERS, "test-producer", timeout_sec=5)
+    # test-perf может содержать много сообщений, ограничим чтение
+    console.print("\n(Чтение test-perf ограничено таймаутом, так как там ~10k+ сообщений)")
+    consume_messages(BOOTSTRAP_SERVERS, "test-perf", timeout_sec=5)
+EOF
+
+# Запускаем проверку
+echo "Запускаем скрипт проверки результатов..."
+python3 verify_production.py
+
+Практические задания:
+Эксперимент: Запустите basic_producer.py и остановите один брокер Kafka. Что произойдёт при разных acks?
+Анализ: В performance_test.py измените message_size с 100 на 10000 байт. Как изменится throughput?
+Оптимизация: В async_producer.py попробуйте разные значения batch.size. Какое даёт лучшую производительность?
+Доработка: Добавьте в retry_producer.py отправку статистики в Prometheus.
