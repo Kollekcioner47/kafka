@@ -377,9 +377,9 @@ services:
     container_name: opensearch
     environment:
       - discovery.type=single-node
-     # - DISABLE_SECURITY_PLUGIN=true
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
       - plugins.security.ssl.http.enabled=false
+      - plugins.security.ssl.transport.enabled=false
       - plugins.security.allow_default_init_securityindex=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=C@nsole47
     ports:
@@ -390,12 +390,17 @@ services:
     networks:
       - lab-network
 
-  # Дополнительно: OpenSearch Dashboards (аналог Kibana)
   dashboards:
     image: opensearchproject/opensearch-dashboards:2.13.0
     container_name: dashboards
     environment:
-      - OPENSEARCH_HOSTS=http://opensearch:9200
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=C@nsole47
+      # Отключаем проверку SSL в самом интерфейсе и при связи с сервером
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - SERVER_SSL_ENABLED=false
+      - OPENSEARCH_SSL_VERIFICATIONMODE=none
     ports:
       - "5601:5601"
     depends_on:
@@ -407,6 +412,7 @@ networks:
   lab-network:
     driver: bridge
 EOF
+
 
 chmod 777 -R opensearch-lab
 cd opensearch-lab
