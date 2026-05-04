@@ -47,6 +47,10 @@ SELECT * FROM pg_publication;
 
 -- Если публикации нет, создаем
 CREATE PUBLICATION orders_pub FOR TABLE orders;
+alter publication orders_pub add table orders;
+alter publication orders_pub;
+alter role labuser replication;
+
 
 -- Вставляем тестовые данные
 INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES
@@ -243,8 +247,8 @@ cat > /tmp/opensearch-aiven-sink.json << 'EOF'
   "config": {
     "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
     "connection.url": "http://10.0.2.30:9200",
-    "connection.username": "",
-    "connection.password": "",
+    "connection.username": "admin",
+    "connection.password": "C@nsole47",
     "topics": "postgres-server.public.orders",
     "type": "_doc",
     "key.ignore": "true",
@@ -356,17 +360,17 @@ curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq .
 
 # 3. Проверяем данные в OpenSearch
 echo "=== Данные в OpenSearch ==="
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=Волков&pretty"
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=ORD-1005&pretty"
+curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=Волков&pretty"
+curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=ORD-1005&pretty"
 
 # 4. Проверяем количество документов
 echo "=== Количество документов ==="
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
+curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
 
 Шаг 5.3: Поиск и агрегация в OpenSearch
 # Поиск по конкретному продукту
 echo "=== Поиск по продукту 'Ноутбук' ==="
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s -u admin:C@nsole47  "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "query": {
     "match": {
@@ -377,7 +381,7 @@ curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 
 
 # Агрегация по статусу заказов
 echo "=== Агрегация по статусам заказов ==="
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "size": 0,
   "aggs": {
@@ -392,7 +396,7 @@ curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 
 
 # Поиск дорогих заказов (> 100000)
 echo "=== Заказы дороже 100000 ==="
-curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "query": {
     "range": {
@@ -411,8 +415,8 @@ curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 
 }'
 
 #Если в последнем запросе ошибка, то возможно неправильное создание индекса, тогда:
-curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
-curl -X PUT "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
+curl -X DELETE -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders"
+curl -X PUT -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
 {
   "mappings": {
     "properties": {
@@ -435,8 +439,8 @@ sudo systemctl status kafka-connect
 sudo journalctl -u kafka-connect -f
 
 # 2. Просмотр логов коннекторов
-curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq '.tasks[0].trace'
-curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq '.tasks[0].trace'
+curl -s -u admin:C@nsole47 http://localhost:8083/connectors/postgres-source-connector/status | jq '.tasks[0].trace'
+curl -s -u admin:C@nsole47 http://localhost:8083/connectors/opensearch-sink-connector/status | jq '.tasks[0].trace'
 
 # 3. Просмотр топиков Kafka Connect
 /opt/kafka/bin/kafka-topics.sh --describe --topic connect-* --bootstrap-server localhost:9092
@@ -493,7 +497,7 @@ sudo systemctl disable kafka-connect
 
 Шаг 7.2: Очистка данных
 # Удаляем индекс в OpenSearch
-curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
+curl -X DELETE -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders"
 
 # Очищаем таблицу в PostgreSQL (опционально)
 # sudo -u postgres psql -d labdb -c "TRUNCATE TABLE orders;"
