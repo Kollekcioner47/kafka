@@ -1,15 +1,22 @@
 # ============================================
-# Лабораторная 6: ksqlDB и Потоковая обработка
+# Лабораторная 4: ksqlDB и потоковая обработка (поверх CDC-пайплайна из лабы 3.2)
 # ============================================
 
 # ЦЕЛИ:
 # 1. Установка и запуск ksqlDB Server
-# 2. Интеграция с Kafka Connect (Debezium для PostgreSQL, Sink для ElasticSearch)
-# 3. Работа со STREAMS и TABLES
+# 2. Подключение ksqlDB к уже работающему Kafka Connect из лабы 3.2
+# 3. Работа со STREAMS и TABLES (чтение CDC-топика postgres-server.public.orders)
 # 4. Оконные функции и агрегации
-# 5. Real-time трансформации
+# 5. Sink агрегатов в OpenSearch
 
 # ВРЕМЯ ВЫПОЛНЕНИЯ: 60-80 минут
+
+# ПРЕ-РЕКВИЗИТ (должна быть выполнена лабораторная 3.2):
+#   - работает Kafka Connect (systemd-сервис kafka-connect, REST http://localhost:8083);
+#   - в Kafka есть топик postgres-server.public.orders с данными CDC.
+# Проверка:
+#   curl -s http://localhost:8083/ | jq .
+#   /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep postgres-server
 
 # ============================================
 # 1. УСТАНОВКА И НАСТРОЙКА KSQLDB
@@ -17,36 +24,32 @@
 
 # Выполняем на kafka1.lab (10.0.2.20)
 
-# 1.1. Скачиваем ksqlDB Server (версия может меняться, проверяйте актуальную)
+# 1.1. Скачиваем ksqlDB Server
+# ВАЖНО: проверьте актуальную версию и совместимость клиента ksqlDB с
+# Kafka 4.1.1 (релизные ноты/матрицу совместимости); при необходимости
+# возьмите более новый релиз ksqlDB либо официальный образ
+# confluentinc/cp-ksqldb-server подходящего тега.
 cd /opt
 sudo wget https://github.com/confluentinc/ksql/releases/download/v0.29.0/ksqldb-server-0.29.0.tar.gz
 sudo tar -xzf ksqldb-server-0.29.0.tar.gz
 sudo mv ksqldb-server-0.29.0 ksqldb
 sudo chown -R kafka:kafka /opt/ksqldb
 
-# 1.2. Создаем директорию для плагинов (Connectors)
-# Нам понадобятся коннекторы: Debezium Postgres (Source) и ElasticSearch (Sink)
-mkdir -p /opt/ksqldb/ext
-cd /opt/ksqldb/ext
+# 1.2. Коннекторы скачивать НЕ нужно — используем ВНЕШНИЙ Kafka Connect из лабы 3.2
+# ksqlDB умеет запускать СОБСТВЕННЫЙ (встроенный) Kafka Connect
+# (ksql.connect.worker.config), но в этой лабе он не нужен и вреден:
+#   - в лабе 3.2 уже работает distributed Kafka Connect (systemd-сервис
+#     kafka-connect, REST http://localhost:8083) с теми же storage-топиками
+#     connect-offsets/configs/status и тем же group.id (connect-cluster);
+#   - второй экземпляр Connect на том же порту 8083 и тех же топиках приведёт
+#     к конфликту/отказу старта, а повторный Debezium-коннектор не сможет
+#     занять уже существующий слот debezium_slot.
+# Поэтому коннекторы (Debezium Postgres и Aiven OpenSearch) уже установлены в
+# лабе 3.2 в /opt/kafka/connect-plugins — здесь мы лишь подключаемся к ним.
 
-# 1.3. Скачиваем необходимые JAR-файлы коннекторов
-# Debezium Postgres Connector (Source)
-sudo wget https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.6.1.Final/debezium-connector-postgres-2.6.1.Final-plugin.tar.gz
-sudo tar -xzf debezium-connector-postgres-2.6.1.Final-plugin.tar.gz
-sudo rm -f debezium-connector-postgres-2.6.1.Final-plugin.tar.gz
+echo "✅ Используем внешний Kafka Connect из лабы 3.2 (коннекторы уже в /opt/kafka/connect-plugins)"
 
-# ElasticSearch Sink Connector
-sudo wget https://repo1.maven.org/maven2/org/apache/kafka/connect/elasticsearch/elasticsearch-sink-connector/3.6.1/elasticsearch-sink-connector-3.6.1.jar
-
-# PostgreSQL JDBC Driver (нужен для коннектора)
-sudo wget https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar
-
-# Права доступа
-sudo chown -R kafka:kafka /opt/ksqldb/ext
-
-echo "✅ Плагины коннекторов загружены в /opt/ksqldb/ext"
-
-# 1.4. Создаем конфигурационный файл ksqlDB
+# 1.3. Создаем конфигурационный файл ksqlDB
 sudo tee /opt/ksqldb/config/ksql-server.properties << 'EOF'
 # Адрес слушателя для REST API (CLI и клиенты подключаются сюда)
 listeners=http://0.0.0.0:8088
@@ -60,8 +63,14 @@ ksql.service.id=ksql-lab-cluster
 # Настройка файловой системы для состояний (KTable)
 ksql.streams.state.dir=/var/lib/ksqldb/state
 
-# Настройка Kafka Connect (встроенный в ksqlDB)
-ksql.connect.worker.config=/opt/ksqldb/config/connect-worker.properties
+# Используем ВНЕШНИЙ Kafka Connect из лабы 3.2 (режим ksqlDB без встроенного
+# Connect): CREATE/DROP CONNECTOR в ksqlDB будут обращаться к этому REST API.
+# ksql.connect.worker.config НЕ задаём — встроенный Connect не запускаем.
+ksql.connect.url=http://localhost:8083
+
+# Читаем историю (снапшот Debezium) с начала, чтобы персистентные запросы
+# обработали данные, уже лежащие в топике к моменту их создания
+ksql.streams.auto.offset.reset=earliest
 
 # Логгирование
 log4j.rootLogger=INFO, stdout, file
@@ -74,34 +83,6 @@ log4j.appender.file.layout=org.apache.log4j.PatternLayout
 log4j.appender.file.layout.ConversionPattern=[%d] %p %m (%c)%n
 EOF
 
-# 1.5. Создаем конфиг для встроенного Kafka Connect
-sudo tee /opt/ksqldb/config/connect-worker.properties << 'EOF'
-# Offset storage (где Connect хранит свои оффсеты)
-offset.storage.topic=connect-offsets
-offset.storage.replication.factor=3
-offset.storage.partitions=3
-
-# Config storage (где хранит конфиги коннекторов)
-config.storage.topic=connect-configs
-config.storage.replication.factor=3
-
-# Status storage (статус коннекторов)
-status.storage.topic=connect-status
-status.storage.replication.factor=3
-status.storage.partitions=3
-
-# Plugin path - ГЛАВНАЯ НАСТРОЙКА! Указываем на скачанные JAR файлы
-plugin.path=/opt/ksqldb/ext
-
-# Key/Value Converters (по умолчанию)
-key.converter=org.apache.kafka.connect.storage.StringConverter
-value.converter=org.apache.kafka.connect.storage.StringConverter
-
-# Рест интерфейс Connect worker
-rest.advertised.host.name=kafka1.lab
-rest.port=8083
-EOF
-
 # Создаем директории для логов и состояния
 sudo mkdir -p /var/log/ksqldb /var/lib/ksqldb/state
 sudo chown -R kafka:kafka /var/log/ksqldb /var/lib/ksqldb/state
@@ -110,68 +91,86 @@ sudo chown -R kafka:kafka /var/log/ksqldb /var/lib/ksqldb/state
 # 2. ЗАПУСК KSQLDB
 # ============================================
 
-# Запуск от пользователя kafka
-sudo -u kafka /opt/ksqldb/bin/ksql-server-start /opt/ksqldb/config/ksql-server.properties &
+# Запускаем от пользователя kafka. Рекомендуемый способ — nohup/tmux с логом,
+# чтобы сервер пережил закрытие SSH-сессии (простой "&" умрёт по SIGHUP).
+
+# Вариант А: nohup (лог — в /var/log/ksqldb/ksqldb.out)
+sudo -u kafka nohup /opt/ksqldb/bin/ksql-server-start \
+  /opt/ksqldb/config/ksql-server.properties \
+  >> /var/log/ksqldb/ksqldb.out 2>&1 &
+
+# Вариант Б (альтернатива): tmux
+# tmux new -s ksqldb
+# sudo -u kafka /opt/ksqldb/bin/ksql-server-start /opt/ksqldb/config/ksql-server.properties
+# (выйти из tmux-сессии, не останавливая сервер: Ctrl+B, затем D)
+
+# ПРИМЕЧАНИЕ про повторный запуск: если сервер уже запущен (например, при
+# повторном прохождении лабы), команда выше упадёт с "Address already in use".
+# Сначала остановите предыдущий процесс:
+#   sudo pkill -f ksql-server    # бинарник называется ksql-server-start
+#                                # (в некоторых сборках — ksql-server-run);
+#                                # альтернатива: найти PID через jps
+# и только потом запускайте заново.
 
 # Ждем запуска
 sleep 10
 
-# Проверяем здоровье
-curl http://localhost:8088/info | jq .
+# Проверяем статус ksqlDB (REST API на 8088)
+curl -s http://localhost:8088/info | jq .
 
-# Проверяем здоровье Kafka Connect (встроенный)
-curl http://localhost:8083/ | jq .
+# Kafka Connect НЕ запускаем повторно — он уже работает из лабы 3.2
+# (внешний Connect, REST http://localhost:8083). Проверяем его доступность:
+curl -s http://localhost:8083/ | jq .
 
 echo ""
 echo "✅ ksqlDB Server запущен на порту 8088"
-echo "✅ Kafka Connect запущен на порту 8083"
+echo "✅ Kafka Connect (внешний, из лабы 3.2) доступен на порту 8083"
 echo ""
 
 
 # ============================================
-# 3. ПОДКЛЮЧЕНИЕ И СОЗДАНИЕ ИСТОЧНИКА (SOURCE CONNECTOR)
+# 3. ИСТОЧНИК ДАННЫХ: ГОТОВЫЙ CDC-ТОПИК ИЗ ЛАБЫ 3.2 (НОВЫЙ KAFKA CONNECT НЕ НУЖЕН)
 # ============================================
 
-# Мы будем использовать интерактивный клиент ksql
-# Для автоматического выполнения лабораторной создадим файл с SQL-командами
+# В лабе 3.2 уже развёрнут Kafka Connect (systemd-сервис kafka-connect) и в нём
+# зарегистрирован Debezium-коннектор (в 3.2 он называется
+# postgres-source-connector). Этот коннектор непрерывно пишет изменения таблицы
+# public.orders в топик postgres-server.public.orders. Создавать второй
+# Debezium-коннектор (или второй Kafka Connect) НЕЛЬЗЯ: тот же слот
+# debezium_slot и публикация orders_pub уже заняты — коннектор упадёт с
+# ошибкой "replication slot already exists / in use".
+# Данные CDC уже текут в Kafka — осталось только проверить это и читать.
 
-cat > /tmp/ksql_lab.sql << 'EOF'
--- ============================================
--- БЛОК 1: НАСТРОЙКА
--- ============================================
-SET 'auto.offset.reset' = 'earliest';
+# 3.1. Проверяем, что внешний Kafka Connect из лабы 3.2 доступен
+curl -s http://localhost:8083/ | jq .
+# Ожидаем JSON со списком версий Kafka Connect (как в лабе 3.2)
 
--- ============================================
--- БЛОК 2: ИМПОРТ ДАННЫХ ИЗ POSTGRES (CDC)
--- Создаем Source Connector с использованием Debezium
--- ============================================
-CREATE SOURCE CONNECTOR postgres_orders_source WITH (
-  'connector.class'='io.debezium.connector.postgresql.PostgresConnector',
-  'database.hostname'='10.0.2.31',
-  'database.port'='5432',
-  'database.user'='labuser',
-  'database.password'='labpassword',
-  'database.dbname'='labdb',
-  'topic.prefix'='pg-labdb-', -- Топики будут называться pg-labdb.orders
-  'plugin.name'='pgoutput',
-  'table.include.list'='public.orders',
-  'slot.name'='debezium_slot' -- Логический слот в PG
-);
+# 3.2. Проверяем, что Debezium-коннектор из лабы 3.2 зарегистрирован и RUNNING
+curl -s http://localhost:8083/connectors | jq .
+# Ожидаем в списке postgres-source-connector (имя коннектора из лабы 3.2)
+curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq .state
+# Ожидаем "RUNNING"
 
--- Ждем появления топика (можно проверить через CLI)
--- SHOW CONNECTORS;
-EOF
+# 3.3. Убеждаемся, что в топике postgres-server.public.orders ЕСТЬ данные.
+# Это детерминированная проверка: выводим одно сообщение и завершаемся
+# (максимум ждём 10 секунд, если топик пуст).
+# Сообщение показывает структуру события Debezium: JSON вида
+# {"before":..., "after":{id, order_number, ..., price}, "op":"c", "ts_ms":...}
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic postgres-server.public.orders \
+  --from-beginning \
+  --max-messages 1 \
+  --timeout-ms 10000
 
-# Выполняем первую часть
-echo "📡 Создаем Conector для PostgreSQL..."
-/opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_lab.sql
-
-# Ждем, пока Debezium сделает начальный снэпшот данных
-echo "⏳ Ждем синхронизации с PostgreSQL (15 сек)..."
-sleep 15
-
-# Проверяем, создался ли топик
-/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list | grep pg-labdb
+# Если данных нет (пустой вывод/таймаут) — вставьте новый заказ в PostgreSQL
+# (10.0.2.31, БД labdb; пароль labpassword — только для учебного контура) и
+# дождитесь его появления в топике. При повторном прохождении лабы возьмите
+# ДРУГОЙ order_number (у колонки UNIQUE-ограничение), например ORD-KSQL-2:
+#   PGPASSWORD=labpassword psql -h 10.0.2.31 -U labuser -d labdb -c \
+#     "INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES \
+#      ('ORD-KSQL-2', 'Студент курса', 'Курс по ksqlDB', 1, 99999.00);"
+#   # затем повторите kafka-console-consumer из шага 3.3
 
 # ============================================
 # 4. РАБОТА С KSQLDB (STREAMS и TABLES)
@@ -179,54 +178,61 @@ sleep 15
 
 cat > /tmp/ksql_processing.sql << 'EOF'
 -- ============================================
--- БЛОК 3: СОЗДАНИЕ ПОТОКА (STREAM)
--- Топик pg-labdb.orders содержит JSON данные от Debezium (с complex schema)
--- Извлекаем полезную нагрузку (AFTER) для упрощения
+-- БЛОК 1: НАСТРОЙКА СЕССИИ
+-- SET 'auto.offset.reset' действует ТОЛЬКО в текущей сессии ksqlDB CLI,
+-- поэтому повторяем его в начале КАЖДОГО файла/вызова (на сервере уже задан
+-- ksql.streams.auto.offset.reset=earliest, но в новой сессии без SET
+-- персистентный запрос мог бы стартовать с конца топика и пропустить
+-- снапшот Debezium из лабы 3.2).
+-- ============================================
+SET 'auto.offset.reset' = 'earliest';
+
+-- ============================================
+-- БЛОК 2: ЧТЕНИЕ CDC-ТОПИКА ИЗ ЛАБЫ 3.2 (STREAM raw_orders)
+-- Топик postgres-server.public.orders пишет Debezium из лабы 3.2.
+-- Значение — JSON без схемы (JsonConverter, schemas.enable=false), обёртка
+-- события: {"before":..., "after":{...}, "source":{...}, "op":"c","ts_ms":...}
+-- Ключи JSON — в нижнем регистре, поэтому колонки/STRUCT объявляем так же.
+-- price объявлен DOUBLE: у Debezium-коннектора в 3.2 должен быть задан
+-- decimal.handling.mode=double (правка конфигурации коннектора в лабе 3.2),
+-- иначе NUMERIC придёт строкой base64 и разбор не сработает. В схеме
+-- используем DOUBLE, а не голый DECIMAL (такого типа в ksqlDB нет).
 -- ============================================
 
--- Сначала посмотрим схему сообщения (опционально, для понимания)
--- PRINT 'pg-labdb.orders' FROM BEGINNING LIMIT 1;
+-- Сначала посмотрим сообщение (опционально, для понимания структуры):
+-- PRINT 'postgres-server.public.orders' FROM BEGINNING LIMIT 1;
 
--- Создаем Stream "сырых" данных, разбирая JSON от Debezium
 CREATE STREAM raw_orders (
-  OP VARCHAR,
-  BEFORE STRUCT<ID INT, ORDER_NUMBER VARCHAR, CUSTOMER_NAME VARCHAR, PRODUCT VARCHAR, QUANTITY INT, PRICE DECIMAL>,
-  AFTER STRUCT<ID INT, ORDER_NUMBER VARCHAR, CUSTOMER_NAME VARCHAR, PRODUCT VARCHAR, QUANTITY INT, PRICE DECIMAL>,
-  TS_MS BIGINT
+  op VARCHAR,
+  before STRUCT<id INT, order_number VARCHAR, customer_name VARCHAR, product VARCHAR, quantity INT, price DOUBLE>,
+  after  STRUCT<id INT, order_number VARCHAR, customer_name VARCHAR, product VARCHAR, quantity INT, price DOUBLE>,
+  ts_ms BIGINT
 ) WITH (
-  KAFKA_TOPIC='pg-labdb.orders',
+  KAFKA_TOPIC='postgres-server.public.orders',
   VALUE_FORMAT='JSON'
 );
 
--- Создаем чистый Stream с данными из поля AFTER
--- Это наша "Событийная модель" заказов
-CREATE STREAM orders_stream (
-  id INT,
-  order_number VARCHAR,
-  customer_name VARCHAR,
-  product VARCHAR,
-  quantity INT,
-  price DECIMAL
-) WITH (
-  KAFKA_TOPIC='orders_clean',
-  VALUE_FORMAT='JSON'
-) AS
+-- ============================================
+-- БЛОК 3: ЧИСТЫЙ ПОТОК ЗАКАЗОВ (STREAM orders_stream)
+-- Извлекаем полезную нагрузку AFTER; события удаления (after = NULL) отбрасываем.
+-- ============================================
+CREATE STREAM orders_stream
+WITH (KAFKA_TOPIC='orders_clean', VALUE_FORMAT='JSON') AS
 SELECT
-  AFTER->id AS id,
-  AFTER->order_number AS order_number,
-  AFTER->customer_name AS customer_name,
-  AFTER->product AS product,
-  AFTER->quantity AS quantity,
-  AFTER->price AS price
+  after->id AS id,
+  after->order_number AS order_number,
+  after->customer_name AS customer_name,
+  after->product AS product,
+  after->quantity AS quantity,
+  after->price AS price
 FROM raw_orders
-WHERE AFTER IS NOT NULL; -- Игнорируем события удаления (если будут)
+WHERE after IS NOT NULL
 EMIT CHANGES;
 
 -- ============================================
--- БЛОК 4: ПРЕОБРАЗОВАНИЯ (ENRICHMENT)
--- Вычисляем итоговую сумму заказа и классифицируем товары
+-- БЛОК 4: ОБОГАЩЕНИЕ (STREAM enriched_orders)
+-- Итоговая сумма заказа и категория товара по цене
 -- ============================================
-
 CREATE STREAM enriched_orders AS
 SELECT
   id,
@@ -235,7 +241,7 @@ SELECT
   product,
   quantity,
   price,
-  (quantity * price) AS total_price, -- Вычисляемая колонка
+  (quantity * price) AS total_price,
   CASE
     WHEN price > 100000 THEN 'Premium'
     WHEN price > 50000 THEN 'Standard'
@@ -245,24 +251,28 @@ FROM orders_stream
 EMIT CHANGES;
 
 -- ============================================
--- БЛОК 5: ОКОННАЯ ФУНКЦИЯ И АГРЕГАЦИЯ (TABLE)
--- Считаем сумму продаж каждые 30 секунд
+-- БЛОК 5: ОКОННАЯ АГРЕГАЦИЯ (TABLE revenue_30s, TUMBLING 30 СЕКУНД)
+-- Канонический вид: WINDOWSTART/WINDOWEND движок добавляет в ключ окна
+-- автоматически — их НЕЛЬЗЯ указывать в GROUP BY, только в SELECT.
+-- Топик результата задаём явно (нижний регистр), в него будет писать sink.
 -- ============================================
-
-CREATE TABLE revenue_30s AS
+CREATE TABLE revenue_30s
+WITH (KAFKA_TOPIC='revenue_30s') AS
 SELECT
-  WINDOWSTART AS window_start,
-  WINDOWEND AS window_end,
   category,
   SUM(total_price) AS total_revenue,
-  COUNT(*) AS order_count
+  COUNT(*) AS order_count,
+  WINDOWSTART AS window_start,
+  WINDOWEND AS window_end
 FROM enriched_orders
 WINDOW TUMBLING (SIZE 30 SECONDS)
-GROUP BY category, WINDOWSTART, WINDOWEND
+GROUP BY category
 EMIT CHANGES;
 
--- Дополнительная таблица: Статистика по клиентам (реальное время)
--- Это TABLE, так как она хранит ЛАТЕЙШЕЕ состояние каждого клиента
+-- ============================================
+-- БЛОК 6: СТАТИСТИКА ПО КЛИЕНТАМ (TABLE client_stats)
+-- TABLE хранит ТЕКУЩЕЕ (последнее по ключу customer_name) состояние
+-- ============================================
 CREATE TABLE client_stats AS
 SELECT
   customer_name,
@@ -277,31 +287,72 @@ EOF
 echo "🔨 Создаем Streams, Tables и агрегации..."
 /opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_processing.sql
 
+# Проверка количества обработанных заказов в ksqlDB (SELECT COUNT(*) с
+# EMIT CHANGES выводит растущий счётчик и завершается по Ctrl+C; PRINT
+# показывает сырые строки топика):
+#   /opt/ksqldb/bin/ksql http://localhost:8088 \
+#     --exec "SET 'auto.offset.reset'='earliest'; SELECT COUNT(*) FROM orders_stream EMIT CHANGES;"
+#   PRINT 'orders_clean' FROM BEGINNING LIMIT 5;
+
+# Детерминированная проверка после создания: читаем одно сообщение из топика
+# orders_clean (пишет orders_stream). Если заказ появился — снапшот обработан.
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic orders_clean \
+  --from-beginning \
+  --max-messages 1 \
+  --timeout-ms 15000
+# Если пусто — история ещё обрабатывается (повторите через 10-15 сек) либо
+# в источнике нет данных: вставьте новый заказ в PostgreSQL (см. шаг 3.3) и
+# дождитесь его появления в топике postgres-server.public.orders.
+
 
 # ============================================
-# 5. SINK В ELASTICSEARCH (КОНЕЧНАЯ ТОЧКА)
+# 5. SINK РЕЗУЛЬТАТОВ В OPENSEARCH (КОНЕЧНАЯ ТОЧКА)
 # ============================================
 
-cat > /tmp/ksql_sink.sql << 'EOF'
--- ============================================
--- БЛОК 6: ЭКСПОРТ В OPENSEARCH
--- Записываем агрегированную статистику в OpenSearch для визуализации
--- ============================================
+# Используем ТОТ ЖЕ Aiven OpenSearch-коннектор, что и в лабе 3.2
+# (io.aiven.kafka.connect.opensearch.OpensearchSinkConnector) — он уже лежит
+# в /opt/kafka/connect-plugins. Создаём коннектор через REST ВНЕШНЕГО Kafka
+# Connect из лабы 3.2 (REST http://localhost:8083) — так же, как в 3.2;
+# отдельный (Confluent/Elasticsearch) sink не нужен и не совместим с курсом.
+# Параметр называется "type" (не "type.name" эпохи ES 6.x), значение "_doc".
+# Топик результата: revenue_30s — ksqlDB записал туда агрегаты из таблицы
+# revenue_30s (имя топика мы задали явно в CTAS, см. блок 5 файла processing).
+# Ключи оконных таблиц ksqlDB — НЕ JSON, поэтому для ключа берём
+# StringConverter (иначе JsonConverter не разберёт ключ окна).
 
-CREATE SINK CONNECTOR es_revenue_sink WITH (
-  'connector.class'='io.confluent.connect.elasticsearch.ElasticsearchSinkConnector',
-  'connection.url'='http://10.0.2.30:9200',
-  'type.name'='_doc',
-  'topics'='REVENUE_30S', -- ksqlDB называет таблицы (результаты агрегаций) заглавными буквами
-  'key.ignore'='true',
-  'schema.ignore'='true',
-  'value.converter'='org.apache.kafka.connect.json.JsonConverter',
-  'value.converter.schemas.enable'='false'
-);
+cat > /tmp/opensearch-revenue-sink.json << 'EOF'
+{
+  "name": "opensearch-revenue-sink",
+  "config": {
+    "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
+    "connection.url": "http://10.0.2.30:9200",
+    "connection.username": "",
+    "connection.password": "",
+    "topics": "revenue_30s",
+    "type": "_doc",
+    "key.ignore": "true",
+    "schema.ignore": "true",
+    "behavior.on.null.values": "ignore",
+    "behavior.on.malformed.documents": "warn",
+    "drop.invalid.message": "true",
+    "tasks.max": "1",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
 EOF
 
-echo "📤 Создаем Sink Connector в OpenSearch..."
-/opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_sink.sql
+echo "📤 Регистрируем Sink-коннектор OpenSearch во внешнем Connect (лаба 3.2)..."
+curl -X POST -H "Content-Type: application/json" \
+  --data @/tmp/opensearch-revenue-sink.json \
+  http://localhost:8083/connectors
+
+# Проверяем статус созданного коннектора
+curl -s http://localhost:8083/connectors/opensearch-revenue-sink/status | jq .state
+# Ожидаем "RUNNING"
 
 echo ""
 echo "✅ КОНФИГУРИРОВАНИЕ KSQLDB ЗАВЕРШЕНО"
@@ -313,59 +364,110 @@ echo ""
 # ============================================
 
 echo "=========================================="
-echo "6.1. ПРОВЕРКА КОННЕКТОРОВ"
+echo "6.1. ПРОВЕРКА КОННЕКТОРОВ (ВНЕШНИЙ KAFKA CONNECT ИЗ ЛАБЫ 3.2)"
 echo "=========================================="
 curl -s http://localhost:8083/connectors | jq .
+# Ожидаем: коннекторы из лабы 3.2 (postgres-source-connector,
+# opensearch-sink-connector) + созданный нами opensearch-revenue-sink
 
 echo ""
 echo "=========================================="
-echo "6.2. СИМУЛЯЦИЯ РЕАЛЬНОЙ НАГРУЗКИ (ПРОДЮСЕР)"
+echo "6.2. ДОБАВЛЯЕМ НОВЫЙ ЗАКАЗ (ПРОДЮСЕР ДАННЫХ — POSTGRESQL)"
 echo "=========================================="
 
-# Откроем новое подключение к PostgreSQL и добавим заказ
+# Вставляем заказ в PostgreSQL (10.0.2.31, БД labdb).
+# ВНИМАНИЕ: пароль labpassword используется только для учебного контура.
+# При ПОВТОРНОМ прохождении лабы заказ ORD-KAFKA-LAB может уже существовать
+# (у order_number UNIQUE-ограничение) — тогда возьмите другой номер, например
+# ORD-KAFKA-LAB-2, и в шаге 6.3 используйте его же.
 echo "Добавляем новый заказ в PostgreSQL..."
 
 PGPASSWORD=labpassword psql -h 10.0.2.31 -U labuser -d labdb -c \
   "INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES \
    ('ORD-KAFKA-LAB', 'Студент курса', 'Курс по ksqlDB', 1, 99999.00);"
+echo "✅ Заказ добавлен. Debezium (лаба 3.2) пишет событие в Kafka."
 
-echo "✅ Заказ добавлен. Debezium уже поймал событие."
+# Детерминированная проверка CDC (вместо sleep+kill): опрашиваем топик с
+# начала, пока не найдём наше событие (order_number уникален — коллизий нет).
+# Каждая попытка сама завершается по таймауту или после прочтения сообщений.
+# Максимум ~15 попыток; между ними пауза 2 секунды.
+FOUND=0
+for attempt in $(seq 1 15); do
+  FOUND=$(/opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 \
+    --topic postgres-server.public.orders \
+    --from-beginning \
+    --max-messages 1000 \
+    --timeout-ms 3000 2>/dev/null | grep -c ORD-KAFKA-LAB)
+  [ "$FOUND" -gt 0 ] && break
+  echo "Попытка $attempt: события с нашим заказом ещё нет, ждём 2 c..."
+  sleep 2
+done
 
-# Ждем обработки (окно 30 сек может не сработать мгновенно, но STREAM отработает)
-sleep 5
-
-echo ""
-echo "=========================================="
-echo "6.3. ЧТЕНИЕ ИЗ KSQLDB (PULL QUERY)"
-echo "=========================================="
-
-# Посмотрим последние обогащенные заказы
-echo "📊 Последние enriched заказы:"
-/opt/ksqldb/bin/ksql http://localhost:8088 --exec "
-  SELECT order_number, category, total_price 
-  FROM enriched_orders 
-  EMIT CHANGES 
-  LIMIT 5;" &
-KSQL_PID=$!
-sleep 3
-kill $KSQL_PID 2>/dev/null
-
-echo ""
-echo "📊 Статистика по клиентам (Pull Query из Table):"
-/opt/ksqldb/bin/ksql http://localhost:8088 --exec "
-  SELECT customer_name, orders_count, spent_total 
-  FROM client_stats;"
+if [ "$FOUND" -gt 0 ]; then
+  echo "✅ Событие CDC с ORD-KAFKA-LAB найдено в топике."
+else
+  echo "❌ Событие не найдено: проверьте, что коннектор из 3.2 жив (см. раздел 3),"
+  echo "   а заказ действительно вставлен (UNIQUE по order_number не нарушен)."
+fi
 
 echo ""
 echo "=========================================="
-echo "6.4. ПРОВЕРКА OPENSEARCH (ДАТА ЛОЖИТСЯ В ES)"
+echo "6.3. ЧТЕНИЕ ИЗ KSQLDB: PUSH- И PULL-ЗАПРОСЫ"
 echo "=========================================="
 
-# Ждем, пока Sink Connector запишет порцию данных
-sleep 5
+# --- Push-запрос (EMIT CHANGES) к STREAM ---
+# Подписывается на события стрима и печатает новые строки по мере их
+# появления; в конце запроса указывается EMIT CHANGES, при необходимости —
+# LIMIT N для остановки. SET 'auto.offset.reset' нужен в начале сессии,
+# чтобы запрос увидел уже накопленные события, а не только новые.
+cat > /tmp/ksql_push.sql << 'EOF'
+SET 'auto.offset.reset' = 'earliest';
+SELECT order_number, category, total_price
+FROM enriched_orders
+EMIT CHANGES
+LIMIT 3;
+EOF
 
-# Делаем запрос в OpenSearch
-echo "📈 Данные в индексе REVENUE_30S:"
+echo "📊 Push-запрос к STREAM enriched_orders (выведет 3 строки и завершится):"
+/opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_push.sql
+
+echo ""
+echo "📊 Pull-запрос к TABLE client_stats по ключу:"
+# --- Pull-запрос к TABLE по ключу ---
+# Табличный pull-запрос возвращает СНИМОК состояния и завершается сам, но
+# обязан содержать WHERE с равенством по ВСЕМ ключевым колонкам таблицы.
+# Ключ client_stats — customer_name (без WHERE по ключу запрос невалиден).
+cat > /tmp/ksql_pull.sql << 'EOF'
+SET 'auto.offset.reset' = 'earliest';
+SELECT customer_name, orders_count, spent_total
+FROM client_stats
+WHERE customer_name = 'Студент курса';
+EOF
+/opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_pull.sql
+# Ожидаем строку со статистикой по клиенту из шага 6.2.
+# Если строки нет — событие ещё обрабатывается: повторите запрос через
+# несколько секунд (pull-запрос можно запускать сколько угодно раз).
+# Если в 6.2 вы взяли другой order_number — подставьте то же имя клиента.
+
+echo ""
+echo "=========================================="
+echo "6.4. ПРОВЕРКА OPENSEARCH (SINK ИЗ РАЗДЕЛА 5)"
+echo "=========================================="
+
+# Sink-коннектор читает топик revenue_30s и пишет документы в индекс
+# revenue_30s (имя индекса = имя топика в нижнем регистре).
+# Оконные результаты появляются после закрытия 30-секундного окна, поэтому
+# опрашиваем индекс в цикле (детерминированная проверка, до ~90 секунд):
+for i in $(seq 1 18); do
+  CNT=$(curl -s "http://10.0.2.30:9200/revenue_30s/_count?pretty" 2>/dev/null | jq '.count // 0' 2>/dev/null || echo 0)
+  echo "Попытка $i: документов в индексе revenue_30s = $CNT"
+  [ "${CNT:-0}" -gt 0 ] && break
+  sleep 5
+done
+
+# Смотрим несколько документов
+echo "📈 Данные в индексе revenue_30s:"
 curl -s "http://10.0.2.30:9200/revenue_30s/_search?pretty&size=3"
 
 echo ""
@@ -374,6 +476,7 @@ echo "📔 ИНСТРУКЦИЯ ДЛЯ СТУДЕНТА:"
 echo "=========================================="
 echo "1. ksqlDB Server запущен на порту 8088"
 echo "2. Войдите в CLI: /opt/ksqldb/bin/ksql http://localhost:8088"
+echo "   (в начале каждого сеанса выполните: SET 'auto.offset.reset'='earliest';)"
 echo ""
 echo "3. Попробуйте команды:"
 echo "   LIST STREAMS;"
@@ -382,8 +485,9 @@ echo "   DESCRIBE EXTENDED enriched_orders;"
 echo ""
 echo "4. Запустите PUSH QUERY (Real-time мониторинг):"
 echo "   SELECT * FROM enriched_orders WHERE category = 'Premium' EMIT CHANGES;"
+echo "   (остановка: Ctrl+C)"
 echo ""
-echo "5. Добавьте еще заказов в PostgreSQL и наблюдайте в ksqlDB:"
+echo "5. Добавьте еще заказов в PostgreSQL и наблюдайте их в ksqlDB:"
 echo "   INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES ('NEW-1', 'User1', 'Mouse', 2, 5000);"
 echo ""
 echo "6. Проверьте графики в OpenSearch Dashboards (http://10.0.2.30:5601):"
@@ -393,6 +497,28 @@ echo ""
 # ============================================
 # 7. ОЧИСТКА (ОПЦИОНАЛЬНО)
 # ============================================
-# curl -X DELETE http://localhost:8083/connectors/postgres_orders_source
-# curl -X DELETE http://localhost:8083/connectors/es_revenue_sink
-# /opt/ksqldb/bin/ksql http://localhost:8088 --exec "DROP STREAM IF EXISTS enriched_orders; DROP TABLE IF EXISTS revenue_30s;"
+# ВНИМАНИЕ: коннекторы и топик лабы 3.2 (postgres-source-connector,
+# opensearch-sink-connector, топик postgres-server.public.orders) НЕ удаляем —
+# они нужны для повторного прохождения курса. Удаляем только объекты этой лабы.
+
+# Останавливаем ksqlDB Server (если больше не нужен):
+# sudo pkill -f ksql-server    # или jps, чтобы найти PID
+
+# Удаляем sink-коннектор, созданный в разделе 5 (внешний Connect из 3.2):
+# curl -X DELETE http://localhost:8083/connectors/opensearch-revenue-sink
+
+# Удаляем потоки/таблицы ksqlDB (в порядке зависимостей, снизу вверх;
+# DELETE TOPIC удаляет и созданные ksqlDB топики — их имена revenue_30s,
+# orders_clean и т.д.). Для raw_orders DELETE TOPIC НЕ используем: он читает
+# топик postgres-server.public.orders из лабы 3.2, который нужно сохранить.
+cat > /tmp/ksql_cleanup.sql << 'EOF'
+SET 'auto.offset.reset' = 'earliest';
+DROP TABLE IF EXISTS client_stats DELETE TOPIC;
+DROP TABLE IF EXISTS revenue_30s DELETE TOPIC;
+DROP STREAM IF EXISTS enriched_orders DELETE TOPIC;
+DROP STREAM IF EXISTS orders_stream DELETE TOPIC;
+DROP STREAM IF EXISTS raw_orders;
+EOF
+# /opt/ksqldb/bin/ksql http://localhost:8088 --file /tmp/ksql_cleanup.sql
+# Если DROP ругается на активные запросы — сначала: SHOW QUERIES; и
+# TERMINATE <query_id>; для каждого, либо остановите сервер (pkill выше).

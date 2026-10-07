@@ -18,9 +18,9 @@ echo "=== Проверка компонентов ==="
 echo "Kafka: ✓"
 
 # 2. Проверяем PostgreSQL (с kafka1)
-psql -h 10.0.2.31 -U labuser -d labdb -c "SELECT version();" || echo "PostgreSQL: ✗"
-#пароль labpassword
-echo "PostgreSQL: ✓"
+# пароль: labpassword
+# Галочка «✓» печатается только при успешном выполнении psql (&&), а не безусловно
+psql -h 10.0.2.31 -U labuser -d labdb -c "SELECT version();" && echo "PostgreSQL: ✓" || echo "PostgreSQL: ✗ (проверьте сеть/учётку labuser)"
 
 # 3. Проверяем OpenSearch
 curl -s http://10.0.2.30:9200/ | grep -q "opensearch" && echo "OpenSearch: ✓" || echo "OpenSearch: ✗"
@@ -42,15 +42,28 @@ CREATE TABLE IF NOT EXISTS orders (
     status VARCHAR(20) DEFAULT 'NEW'
 );
 
+-- На случай, если таблица создана лабой 1 БЕЗ ограничения UNIQUE (1_install):
+-- CREATE TABLE IF NOT EXISTS существующую таблицу не меняет, а INSERT ...
+-- ON CONFLICT (order_number) без UNIQUE упал бы с ошибкой
+-- «no unique or exclusion constraint matching the ON CONFLICT specification».
+-- Добавляем ограничение, только если его ещё нет:
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_order_number_key') THEN
+        ALTER TABLE orders ADD CONSTRAINT orders_order_number_key UNIQUE (order_number);
+    END IF;
+END $$;
+
 -- Проверяем публикацию (должна быть создана ранее)
 SELECT * FROM pg_publication;
 
--- Если публикации нет, создаем
-CREATE PUBLICATION orders_pub FOR TABLE orders;
-alter publication orders_pub add table orders;
-alter publication orders_pub;
-alter role labuser replication;
-
+-- Публикация могла быть создана в лабе 1 — создаём только если её ещё нет
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'orders_pub') THEN
+        CREATE PUBLICATION orders_pub FOR TABLE orders;
+    END IF;
+END $$;
 
 -- Вставляем тестовые данные
 INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES
@@ -60,6 +73,10 @@ INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUE
 ('ORD-1004', 'Алексей Козлов', 'Монитор Samsung', 1, 34999.00),
 ('ORD-1005', 'Ольга Новикова', 'Клавиатура механическая', 3, 8999.00)
 ON CONFLICT (order_number) DO NOTHING;
+
+-- Примечание: если лаба 1 уже вставила ORD-001..003, то при снэпшоте в топике
+-- будет 8 записей (3 + 5), если нет — 5. Ниже ожидания сформулированы как
+-- «не менее 5» — сверяйтесь с фактическим числом записей в своей БД.
 
 -- Проверяем данные
 SELECT * FROM orders ORDER BY id;
@@ -76,10 +93,13 @@ sudo chown -R kafka:kafka /opt/kafka/connect-plugins
 sudo apt install zip jq -y
 
 # Скачиваем Debezium PostgreSQL Connector
-sudo -u kafka wget -P /tmp https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.6.0.Final/debezium-connector-postgres-2.6.0.Final-plugin.tar.gz
+# Версия Debezium единая по курсу: 2.6.1.Final (та же, что в лабе 4).
+# Если берёте другую версию — сверьте матрицу совместимости Debezium с вашим
+# Kafka (в курсе 4.1.1) и версией PostgreSQL на VM (см. 1_install).
+sudo -u kafka wget -P /tmp https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.6.1.Final/debezium-connector-postgres-2.6.1.Final-plugin.tar.gz
 
 # Распаковываем
-sudo -u kafka tar -xzf /tmp/debezium-connector-postgres-2.6.0.Final-plugin.tar.gz -C /opt/kafka/connect-plugins/
+sudo -u kafka tar -xzf /tmp/debezium-connector-postgres-2.6.1.Final-plugin.tar.gz -C /opt/kafka/connect-plugins/
 
 # Скачиваем OpenSource OpenSearch Connector от Aiven
 sudo -u kafka wget -P /tmp https://github.com/Aiven-Open/opensearch-connector-for-apache-kafka/releases/download/v3.0.0/opensearch-connector-for-apache-kafka-3.0.0.zip
@@ -184,6 +204,16 @@ curl -s http://localhost:8083/ | jq . 2>/dev/null || curl -s http://localhost:80
 Шаг 3.1: Создание Debezium Source Connector
 
 # Создаем конфигурацию Debezium Connector
+# decimal.handling.mode=double: иначе DECIMAL(10,2) уходит в топик как base64-строка
+# (JsonConverter + schemas.enable=false), и поле price нельзя фильтровать/агрегировать.
+# Примечание: double теряет «копеечную» точность DECIMAL — для учебной задачи приемлемо,
+# в проде рассмотрите Schema Registry/Avro.
+# Ключ сообщения: transforms.extractKey вынимает из ключа {"id": N} поле id,
+# transforms.castKey приводит его к строке (Cast$Key, spec=string), а
+# key.converter=StringConverter кладёт в ключ строковый id записи.
+# Важно: без Cast ключ был бы целым числом, а StringConverter принимает только
+# строки (DataException). Без строкового ключа sink-коннектор не смог бы
+# перезаписывать тот же документ и удалять его (см. пояснения в шагах 4.1 и 4.3).
 cat > /tmp/debezium-source-fixed.json << 'EOF'
 {
   "name": "postgres-source-connector",
@@ -200,9 +230,15 @@ cat > /tmp/debezium-source-fixed.json << 'EOF'
     "slot.name": "debezium_slot",
     "publication.name": "orders_pub",
     "snapshot.mode": "initial",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "decimal.handling.mode": "double",
+    "transforms": "extractKey,castKey",
+    "transforms.extractKey.type": "org.apache.kafka.connect.transforms.ExtractField$Key",
+    "transforms.extractKey.field": "id",
+    "transforms.castKey.type": "org.apache.kafka.connect.transforms.Cast$Key",
+    "transforms.castKey.spec": "string",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter.schemas.enable": "false",
     "errors.log.enable": "true",
     "errors.log.include.messages": "true"
@@ -231,40 +267,60 @@ curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq .
 #   --timeout-ms 10000
 
 # Или посмотрим несколько сообщений
-echo "=== Проверка первых 5 сообщений в топике ==="
+# Проверяем по отдельности: (а) создан ли топик, (б) читается ли он.
+# Раньше stderr прятался в /dev/null и одна ветка «|| echo» не отличала
+# «топика нет» от «топик пуст/таймаут/ошибка» — теперь причины видны.
+
+# (а) Создан ли топик данных:
+echo "=== Проверка: топик postgres-server создан? ==="
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep '^postgres-server' \
+  || echo "Топик еще не создан — проверьте статус коннектора (команда выше) и журнал kafka-connect"
+
+# (б) Читаем сообщения (stderr НЕ прячем — по нему видна причина при ошибке):
+echo "=== Читаем из топика: не менее 5 сообщений ==="
 /opt/kafka/bin/kafka-console-consumer.sh \
   --topic postgres-server.public.orders \
   --from-beginning \
   --bootstrap-server localhost:9092 \
   --max-messages 5 \
-  --timeout-ms 5000 2>/dev/null || echo "Топик еще не создан, ожидаем..."
+  --timeout-ms 5000
+# Разбор результата:
+#  * сообщения печатаются, код возврата 0 — топик читается, всё в порядке;
+#  * пустой вывод и таймаут (~5 с) — топик создан, но данных ещё нет: снэпшот
+#    Debezium не завершился, подождите и повторите;
+#  * текст ошибки — проблема с топиком/брокером/доступом (см. Часть 6).
+# Ожидание: не менее 5 сообщений (8, если лаба 1 уже вставила ORD-001..003 — 3 + 5).
 
 Шаг 4.1: Конфигурация OpenSource Sink Connector
 # Создаем конфигурацию для OpenSource OpenSearch Connector от Aiven
+# Ключевая схема sink: key.ignore=false — _id документа в OpenSearch берётся из
+# КЛЮЧА сообщения (строковый id строки, задан на source-коннекторе в шаге 3.1).
+# Тогда UPDATE перезаписывает тот же документ, а DELETE (tombstone со value=null)
+# удаляет его: behavior.on.null.values=delete.
 cat > /tmp/opensearch-aiven-sink.json << 'EOF'
 {
   "name": "opensearch-sink-connector",
   "config": {
     "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
     "connection.url": "http://10.0.2.30:9200",
-    "connection.username": "admin",
-    "connection.password": "C@nsole47",
+    "connection.username": "",
+    "connection.password": "",
     "topics": "postgres-server.public.orders",
     "type": "_doc",
-    "key.ignore": "true",
+    "key.ignore": "false",
     "schema.ignore": "true",
     "batch.size": "10",
     "max.buffered.records": "1000",
     "flush.timeout.ms": "10000",
     "max.retries": "10",
     "retry.backoff.ms": "1000",
-    "behavior.on.null.values": "ignore",
+    "behavior.on.null.values": "delete",
     "behavior.on.malformed.documents": "warn",
     "drop.invalid.message": "true",
     "tasks.max": "1",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter.schemas.enable": "false"
   }
 }
@@ -287,6 +343,8 @@ echo "=== Проверка индексов в OpenSearch ==="
 curl -s "http://10.0.2.30:9200/_cat/indices?v" | grep postgres-server || echo "Индекс еще не создан"
 
 # Проверяем количество документов в индексе
+# Ожидание: count = числу строк в orders — не менее 5 (8, если лаба 1 уже
+# вставила ORD-001..003) и совпадает с числом записей в топике (шаг 3.2)
 curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
 
 # Просматриваем несколько документов
@@ -295,32 +353,73 @@ curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?size=3&pret
 
 ### Шаг 4.3: Настройка правильного маппинга в OpenSearch
 
-По умолчанию OpenSearch может определить поле `price` как `text`, а не как числовое. 
-Для правильной работы числовых операций нужно создать индекс с явным маппингом:
+Почему `price` раньше приходил не числом: по умолчанию Debezium передаёт
+DECIMAL(10,2) как бинарное значение (decimal.handling.mode=precise), а JsonConverter
+при schemas.enable=false упаковывает байты в base64-строку. Такое поле в OpenSearch
+выглядит как строка/текст — range-запросы и агрегации по нему не работают, и никакой
+маппинг (float/scaled_float) из base64-строки число не сделает.
+Решение: в конфиге source-коннектора задан decimal.handling.mode=double (шаг 3.1),
+поэтому `price` приходит в топик обычным JSON-числом. Ему нужен числовой маппинг
+"double" (или "float"); scaled_float больше не требуется.
+Примечание: double теряет «копеечную» точность DECIMAL(10,2) — для учебной задачи
+приемлемо; в проде используйте Schema Registry/Avro.
+
+Ниже — единая процедура «лечения» индекса (удалить индекс → создать с маппингом →
+сбросить offsets → пересоздать коннектор → проверить count).
+ВАЖНО про offsets: DELETE коннектора НЕ сбрасывает offsets — они хранятся в служебном
+топике connect-offsets и переживают удаление коннектора. Поэтому удаление коннектора
+и пересоздание индекса БЕЗ сброса offsets приведёт к тому, что коннектор продолжит
+чтение с последней позиции и новый (пустой) индекс так и останется пустым — старые
+документы будут потеряны.
 
 ```bash
 # 1. Удаляем автоматически созданный индекс
 curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
 
-# 2. Создаем индекс с правильным маппингом
+# 2. Создаем индекс с явным маппингом: price — число (в топике теперь JSON-число)
 curl -X PUT "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
 {
   "mappings": {
     "properties": {
-      "price": { "type": "float" },
-      "quantity": { "type": "integer" },
       "id": { "type": "integer" },
-      "order_date": { "type": "date" }
+      "order_number": { "type": "keyword" },
+      "customer_name": { "type": "text" },
+      "product": { "type": "text" },
+      "quantity": { "type": "integer" },
+      "price": { "type": "double" },
+      "order_date": { "type": "date" },
+      "status": { "type": "keyword" }
     }
   }
 }'
 
-# 3. Перезапускаем коннектор для переиндексации данных
+# 3. Сбрасываем offsets группы sink-коннектора в начало топика (см. «ВАЖНО» выше):
+#    без этого коннектор не перечитает топик заново и в новый индекс ничего не запишет
+/opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group connect-opensearch-sink-connector \
+  --reset-offsets --to-earliest \
+  --topic postgres-server.public.orders \
+  --execute
+
+# 4. Пересоздаем sink-коннектор из существующего конфига (тот же, что в шаге 4.1)
 curl -X DELETE http://localhost:8083/connectors/opensearch-sink-connector
 sleep 5
 curl -X POST -H "Content-Type: application/json" \
-  --data @/tmp/opensearch-sink-fixed.json \
+  --data @/tmp/opensearch-aiven-sink.json \
   http://localhost:8083/connectors
+
+# 5. Ждем индексации и проверяем количество документов:
+#    не менее 5 (8, если лаба 1 выполнена) — как в шаге 4.2
+sleep 10
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
+
+# 6. Гигиена: конфиги содержат пароль БД — удаляем их из /tmp.
+#    В проде пароли в конфигах/репозиториях не хранят: переменные окружения,
+#    файлы секретов/менеджер секретов. Учебный контур изолирован, но привычку
+#    закрепляем сразу (после шага 4.3 файлы больше нигде не нужны).
+rm -f /tmp/debezium-source-fixed.json /tmp/opensearch-aiven-sink.json
+```
 
 Часть 5: Тестирование end-to-end пайплайна
 Шаг 5.1: Добавление новых данных в PostgreSQL
@@ -360,17 +459,21 @@ curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq .
 
 # 3. Проверяем данные в OpenSearch
 echo "=== Данные в OpenSearch ==="
-curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=Волков&pretty"
-curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=ORD-1005&pretty"
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=Волков&pretty"
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?q=ORD-1005&pretty"
 
 # 4. Проверяем количество документов
+# Ожидание: INSERT (ORD-1006) добавляет 1 документ, DELETE (ORD-1004) удаляет 1,
+# UPDATE (ORD-1005) count не меняет → итог равен числу строк в orders (5 или 8),
+# т.е. совпадает с count из шага 4.3. Важно: документа ORD-1004 в индексе быть
+# НЕ должно (удалён tombstone'ом), документ ORD-1006 — должен появиться.
 echo "=== Количество документов ==="
-curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_count?pretty"
 
 Шаг 5.3: Поиск и агрегация в OpenSearch
 # Поиск по конкретному продукту
 echo "=== Поиск по продукту 'Ноутбук' ==="
-curl -s -u admin:C@nsole47  "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "query": {
     "match": {
@@ -381,7 +484,7 @@ curl -s -u admin:C@nsole47  "http://10.0.2.30:9200/postgres-server.public.orders
 
 # Агрегация по статусу заказов
 echo "=== Агрегация по статусам заказов ==="
-curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "size": 0,
   "aggs": {
@@ -396,7 +499,7 @@ curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/
 
 # Поиск дорогих заказов (> 100000)
 echo "=== Заказы дороже 100000 ==="
-curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
+curl -s "http://10.0.2.30:9200/postgres-server.public.orders/_search?pretty" -H 'Content-Type: application/json' -d'
 {
   "query": {
     "range": {
@@ -414,23 +517,14 @@ curl -s -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders/
   ]
 }'
 
-#Если в последнем запросе ошибка, то возможно неправильное создание индекса, тогда:
-curl -X DELETE -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders"
-curl -X PUT -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders" -H 'Content-Type: application/json' -d'
-{
-  "mappings": {
-    "properties": {
-      "id": { "type": "integer" },
-      "order_number": { "type": "keyword" },
-      "customer_name": { "type": "text" },
-      "product": { "type": "text" },
-      "quantity": { "type": "integer" },
-      "price": { "type": "scaled_float", "scaling_factor": 100 },
-      "order_date": { "type": "date" },
-      "status": { "type": "keyword" }
-    }
-  }
-}'
+# Если в запросе выше ошибка маппинга/типа (например, price пришла строкой из-за
+# base64 от старой конфигурации) — НЕ чините индекс DELETE+PUT вручную: выполните
+# единую процедуру «лечения» из шага 4.3 (удалить индекс → создать с маппингом →
+# сбросить offsets → пересоздать коннектор → проверить count).
+# Если base64-записи уже успели попасть в топик (топик создавался ДО перехода на
+# decimal.handling.mode=double), дополнительно удалите топик
+# postgres-server.public.orders и пересоздайте source-коннектор — иначе сброс offsets
+# в начало перечитает старые «битые» записи, и они не проиндексируются.
 
 Часть 6: Мониторинг и устранение неисправностей
 Шаг 6.1: Полезные команды для мониторинга
@@ -439,11 +533,16 @@ sudo systemctl status kafka-connect
 sudo journalctl -u kafka-connect -f
 
 # 2. Просмотр логов коннекторов
-curl -s -u admin:C@nsole47 http://localhost:8083/connectors/postgres-source-connector/status | jq '.tasks[0].trace'
-curl -s -u admin:C@nsole47 http://localhost:8083/connectors/opensearch-sink-connector/status | jq '.tasks[0].trace'
+curl -s http://localhost:8083/connectors/postgres-source-connector/status | jq '.tasks[0].trace'
+curl -s http://localhost:8083/connectors/opensearch-sink-connector/status | jq '.tasks[0].trace'
 
 # 3. Просмотр топиков Kafka Connect
-/opt/kafka/bin/kafka-topics.sh --describe --topic connect-* --bootstrap-server localhost:9092
+# kafka-topics.sh не поддерживает wildcard 'connect-*' — сначала показываем список
+# служебных топиков, затем описываем каждый по точному имени:
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep '^connect-'
+/opt/kafka/bin/kafka-topics.sh --describe --topic connect-offsets --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --describe --topic connect-configs --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --describe --topic connect-status --bootstrap-server localhost:9092
 
 # 4. Проверка consumer lag
 /opt/kafka/bin/kafka-consumer-groups.sh \
@@ -491,13 +590,39 @@ curl -X DELETE http://localhost:8083/connectors/opensearch-sink-connector
 sudo systemctl stop kafka-connect
 sudo systemctl disable kafka-connect
 
-# Удаляем топики Kafka (опционально)
+# Удаляем топики Kafka (опционально; при повторном прохождении лабы — обязательно)
 /opt/kafka/bin/kafka-topics.sh --delete --topic postgres-server.public.orders --bootstrap-server localhost:9092
-/opt/kafka/bin/kafka-topics.sh --delete --topic connect-* --bootstrap-server localhost:9092
+
+# kafka-topics.sh не поддерживает wildcard 'connect-*': сначала список, затем — по именам
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep '^connect-'
+/opt/kafka/bin/kafka-topics.sh --delete --topic connect-offsets --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --delete --topic connect-configs --bootstrap-server localhost:9092
+/opt/kafka/bin/kafka-topics.sh --delete --topic connect-status --bootstrap-server localhost:9092
+
+# При повторном прохождении лабы удаление служебных топиков connect-* и топика данных
+# обязательно: иначе offsets/конфиги предыдущего прогона повлияют на новый
+# (например, sink-коннектор продолжит чтение со старых позиций).
 
 Шаг 7.2: Очистка данных
 # Удаляем индекс в OpenSearch
-curl -X DELETE -u admin:C@nsole47 "http://10.0.2.30:9200/postgres-server.public.orders"
+curl -X DELETE "http://10.0.2.30:9200/postgres-server.public.orders"
+
+# На PostgreSQL (10.0.2.31):
+# Слот репликации Debezium НЕ удаляется вместе с коннектором: он переживает его
+# удаление и блокирует повторный запуск этой лабы и лабу 4
+# («replication slot ... is already active / already exists»). Удаляем слот,
+# если он ещё существует (DO-блок безопасен и для первого прогона):
+sudo -u postgres psql -d labdb << 'EOF'
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'debezium_slot') THEN
+        PERFORM pg_drop_replication_slot('debezium_slot');
+    END IF;
+END $$;
+EOF
+
+# Проверяем, что слотов не осталось
+sudo -u postgres psql -d labdb -c "SELECT slot_name, active FROM pg_replication_slots;"
 
 # Очищаем таблицу в PostgreSQL (опционально)
 # sudo -u postgres psql -d labdb -c "TRUNCATE TABLE orders;"
@@ -550,6 +675,14 @@ Sink (OpenSearch): Подключение к кластеру, сопостав�
 Что происходит при удалении записи из PostgreSQL?
 Генерируется ли сообщение в Kafka?
 Удаляется ли документ из OpenSearch?
+Краткие ответы на вопросы про UPDATE/DELETE (в данной конфигурации):
+— UPDATE: одно сообщение (событие обновления, tombstone не пишется). Документ в
+  OpenSearch перезаписывается: key.ignore=false → _id берётся из строкового ключа
+  сообщения (id строки), поэтому обновляется тот же документ.
+— DELETE: Debezium пишет сообщение об удалении, а затем tombstone (value = null).
+  Документ из OpenSearch удаляется: да, потому что key.ignore=false (sink использует
+  ключ как _id) и behavior.on.null.values=delete (tombstone превращается в
+  DELETE-запрос к индексу).
 Как обеспечивается отказоустойчивость пайплайна?
 Что произойдет, если Kafka Connect упадет?
 Что произойдет, если OpenSearch будет недоступен?

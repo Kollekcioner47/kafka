@@ -9,7 +9,9 @@ sudo apt install -y openjdk-21-jdk wget curl net-tools htop ufw
 sudo useradd -r -m -U -s /bin/bash kafka
 
 # /etc/hosts (замените IP на свои!)
-cat >> /etc/hosts << EOF
+# Если записи уже есть (повторный запуск) — пропустите шаг или удалите дубли:
+sudo sed -i '/kafka[123]\.lab/d' /etc/hosts
+sudo tee -a /etc/hosts > /dev/null << 'EOF'
 10.0.2.20 kafka1.lab
 10.0.2.21 kafka2.lab  
 10.0.2.22 kafka3.lab
@@ -19,9 +21,13 @@ EOF
 sudo hostnamectl set-hostname kafka1.lab
 
 # Firewall
+sudo ufw allow OpenSSH  # Иначе включение ufw оборвёт SSH-подключение!
 sudo ufw allow from 10.0.2.0/24 to any port 9092:9095 proto tcp
 sudo ufw --force enable
 sudo ufw status  # Должно быть 9092-9095 ALLOW
+# Если ваша версия ufw не принимает диапазон «9092:9095» — разбейте на два правила:
+#   sudo ufw allow from 10.0.2.0/24 to any port 9092:9094 proto tcp
+#   sudo ufw allow from 10.0.2.0/24 to any port 9095 proto tcp
 
 
 2) Установка kafka
@@ -32,17 +38,22 @@ sudo tar xzf kafka_2.13-4.1.1.tgz
 sudo mv kafka_2.13-4.1.1 kafka
 sudo chown -R kafka:kafka /opt/kafka
 
-# Сгенерировать UUID (один раз!)
+# Сгенерировать UUID кластера — ВЫПОЛНИТЬ ТОЛЬКО НА kafka1.lab!
+# (UUID должен быть ОДИН и тот же на всех трёх нодах кластера)
 CLUSTER_ID=$(/opt/kafka/bin/kafka-storage.sh random-uuid)
 echo $CLUSTER_ID > /tmp/cluster-id.txt
 echo "Cluster ID: $CLUSTER_ID"  # Скопируйте на kafka2/3!
-# После генерации на kafka1:
-echo "Cluster ID для копирования: $CLUSTER_ID"
-# На kafka2 и kafka3 выполнить:
-# CLUSTER_ID=<скопированное_значение>
-# echo $CLUSTER_ID > /tmp/cluster-id.txt
+# На kafka2 и kafka3 выполните (замените <CLUSTER_ID_с_kafka1> на значение, выведенное выше на kafka1):
+sudo bash -c 'echo <CLUSTER_ID_с_kafka1> > /tmp/cluster-id.txt'
+# Проверка — на ВСЕХ нодах (kafka1, kafka2, kafka3) должен быть один и тот же ID:
+cat /tmp/cluster-id.txt
 
 На КАЖДОЙ VM: Конфигурация + Форматирование
+# ВАЖНО (для kafka2 и kafka3!): этот файл server.properties используется не только при
+# старте сервиса, но и при ФОРМАТИРОВАНИИ storage (команда ниже). Поэтому ДО выполнения
+# heredoc измените в тексте конфига: node.id (на kafka2 = 2, на kafka3 = 3) и
+# advertised.listeners (на kafka2 = 10.0.2.21:9092, на kafka3 = 10.0.2.22:9092).
+# Иначе и форматирование, и старт ноды пройдут с неверным конфигом.
 # Config для kafka1 (адаптируйте node.id и IP!)
 sudo apt install postgresql-client -y
 sudo mkdir -p /opt/kafka/config/kraft
@@ -138,7 +149,10 @@ sudo mkdir -p /opt/kafka/data
 sudo chown -R kafka:kafka /opt/kafka
 
 # Форматировать storage (используйте ваш CLUSTER_ID!)
-sudo /opt/kafka/bin/kafka-storage.sh format -t $(cat /tmp/cluster-id.txt) -c /opt/kafka/config/kraft/server.properties
+# ВАЖНО: выполняем форматирование ОТ ПОЛЬЗОВАТЕЛЯ kafka (sudo -u kafka). Если отформатировать
+# от root, каталоги данных создадутся от root, и сервис (User=kafka) не сможет в них писать —
+# при старте будет Permission denied в /opt/kafka/data.
+sudo -u kafka /opt/kafka/bin/kafka-storage.sh format -t $(cat /tmp/cluster-id.txt) -c /opt/kafka/config/kraft/server.properties
 
 kafka2: node.id=2, advertised.listeners=PLAINTEXT://10.0.2.21:9092
 kafka3: node.id=3, 10.0.2.22:9092
@@ -232,20 +246,26 @@ sudo /opt/kafka/bin/kafka-topics.sh --create --topic lab-topic --bootstrap-serve
 
 # Проверить репликацию
 /opt/kafka/bin/kafka-topics.sh --describe --topic lab-topic --bootstrap-server localhost:9092
-# Ожидаемо: Leader:1 Replicas:1,2,3 ISR:1,2,3 (для всех 6 partitions)
+# Ожидаемо: у всех 6 партиций Replicas:1,2,3 и ISR:1,2,3; Leader у разных партиций РАЗНЫЙ (лидеры распределены по брокерам 1-3)
 
 # Producer
 /opt/kafka/bin/kafka-console-producer.sh --topic lab-topic --bootstrap-server kafka1.lab:9092,kafka2.lab:9092 <<<'{"msg": "test1"}'
 
-# Consumer
-/opt/kafka/bin/kafka-console-consumer.sh --topic lab-topic --from-beginning --bootstrap-server localhost:9092 --max-messages 1
+# Consumer — запускаем с --group lab-group, чтобы группа существовала для проверки ниже
+/opt/kafka/bin/kafka-console-consumer.sh --topic lab-topic --from-beginning --bootstrap-server localhost:9092 --max-messages 1 --group lab-group
 # Проверить метаданные кластера
+# kafka-metadata-shell.sh открывает снапшот метаданных из /opt/kafka/data (каталог принадлежит
+# пользователю kafka) — при Permission denied выполните под kafka: sudo -u kafka ...
+# ВАЖНО: --snapshot принимает ОДИН файл. Если в каталоге несколько .log-сегментов,
+# укажите самый ранний: /opt/kafka/data/__cluster_metadata-0/00000000000000000000.log
 /opt/kafka/bin/kafka-metadata-shell.sh --snapshot /opt/kafka/data/__cluster_metadata-0/*.log
 
 # Проверить все топики (включая системные)
 /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
 
 # Проверить потребление (consumer lag)
+# Ожидаемы группы: lab-group (создана консьюмером выше с --group lab-group), а также, возможно,
+# ephemeral-группы консольных консьюмеров, запущенных БЕЗ --group (имя вида console-consumer-<число>).
 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
 
 #Failover тест
@@ -272,18 +292,41 @@ sudo ss -tlnp | grep :9092
 df -h /opt/kafka
 sudo du -sh /opt/kafka/data/*
 
+# Частые ошибки Kafka:
+# (а) «log directory ... is already formatted» при повторном запуске — каталог уже
+#     отформатирован. Решение: остановить kafka, очистить данные и переформатировать
+#     ТЕМ ЖЕ cluster id:
+#       sudo systemctl stop kafka
+#       sudo rm -rf /opt/kafka/data/*
+#       sudo -u kafka /opt/kafka/bin/kafka-storage.sh format -t $(cat /tmp/cluster-id.txt) -c /opt/kafka/config/kraft/server.properties
+# (б) Permission denied при старте сервиса в /opt/kafka/data — storage отформатирован от root
+#     (или каталоги принадлежат root). Решение: переформатировать под пользователем kafka
+#     (sudo -u kafka ... format, как в шаге выше) либо просто исправить владельца:
+#       sudo chown -R kafka:kafka /opt/kafka/data
+# (в) Ошибка «Cluster ID ... doesn't match» — cluster id на нодах различается (ноды
+#     отформатированы с разными ID). Решение: привести /tmp/cluster-id.txt к одному значению
+#     на всех нодах (перегенерировать на kafka1, скопировать на kafka2/kafka3), затем на
+#     каждой ноде: sudo systemctl stop kafka, sudo rm -rf /opt/kafka/data/* и переформатировать
+#     тем же cluster id (команда из пункта «а»).
 
-#VM postgresql с установленным PostgreSQL17
+
+#VM postgresql с установленным PostgreSQL (на Debian 13 — версия 17; проверьте фактическую: ls /etc/postgresql)
 Предварительная настройка PostgreSQL (10.0.2.31)
 1. Настройка PostgreSQL для CDC (Change Data Capture)
-# Подключаемся к виртуалке с PostgreSQL
-ssh user@10.0.2.31
+# Контекст выполнения: команды этого раздела (ниже, до п. 16) выполняются НА самой VM 10.0.2.31 —
+# в её консоли или по SSH под административным пользователем этой VM.
+# С kafka1 доступ к этой БД выполняется ТОЛЬКО через psql под учёткой labuser (см. п. 16 ниже).
+# Вход на VM 10.0.2.31 (если работаете удалённо; замените <пользователь> на администратора этой VM):
+# ssh <пользователь>@10.0.2.31
+# Определяем фактическую версию PostgreSQL и используем её в путях ниже
+PGVER=$(ls /etc/postgresql | head -n1)
+echo "Версия PostgreSQL: $PGVER"
 
 # 1. Останавливаем PostgreSQL для настройки
 sudo systemctl stop postgresql
 
 # 2. Настраиваем конфигурацию для логической репликации
-sudo nano /etc/postgresql/15/main/postgresql.conf
+sudo nano /etc/postgresql/$PGVER/main/postgresql.conf
 # Разрешаем логическую репликацию
 wal_level = logical
 
@@ -300,7 +343,7 @@ listen_addresses = '*'
 shared_buffers = 128MB
 2. Настройка аутентификации
 # 3. Редактируем pg_hba.conf для разрешения подключений
-sudo nano /etc/postgresql/15/main/pg_hba.conf
+sudo nano /etc/postgresql/$PGVER/main/pg_hba.conf
 Добавить в конец файла:
 # Разрешаем подключение из сети 10.0.2.0/24
 host    all             all             10.0.2.0/24            md5
@@ -328,7 +371,7 @@ ALTER USER labuser WITH REPLICATION;
 # 10. Создаем тестовую таблицу
 CREATE TABLE orders (
     id SERIAL PRIMARY KEY,
-    order_number VARCHAR(50) NOT NULL,
+    order_number VARCHAR(50) NOT NULL UNIQUE,
     customer_name VARCHAR(100),
     product VARCHAR(100),
     quantity INT DEFAULT 1,
@@ -338,7 +381,8 @@ CREATE TABLE orders (
 );
 
 # 11. Включаем логирование изменений для таблицы (публикацию)
-CREATE PUBLICATION orders_pub FOR TABLE orders;
+# Обёрнуто в DO-блок: при повторном запуске публикация уже существует — ошибки не будет
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='orders_pub') THEN CREATE PUBLICATION orders_pub FOR TABLE orders; END IF; END $$;
 
 # 12. Даем права на таблицу
 GRANT ALL PRIVILEGES ON TABLE orders TO labuser;
@@ -348,7 +392,8 @@ GRANT USAGE, SELECT ON SEQUENCE orders_id_seq TO labuser;
 INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES
 ('ORD-001', 'Иван Иванов', 'Ноутбук', 1, 150000.00),
 ('ORD-002', 'Петр Петров', 'Смартфон', 2, 80000.00),
-('ORD-003', 'Мария Сидорова', 'Планшет', 1, 50000.00);
+('ORD-003', 'Мария Сидорова', 'Планшет', 1, 50000.00)
+ON CONFLICT (order_number) DO NOTHING;
 
 # 14. Выходим из psql
 \q
@@ -367,21 +412,21 @@ SELECT * FROM pg_publication;
 \q
 
 Предварительная настройка Elasticsearch (10.0.2.30)
-mkdir -p opensearch-lab/data
+# ВАЖНО: все команды этого раздела выполняются НА самой VM 10.0.2.30
+# под пользователем engineer (путь ~/opensearch-lab — это /home/engineer/opensearch-lab).
+mkdir -p ~/opensearch-lab/data
 
 подготовленный Docker Compose
 cat > /home/engineer/opensearch-lab/docker-compose.yml << 'EOF'
+version: '3.8'
 services:
   opensearch:
     image: opensearchproject/opensearch:2.13.0
     container_name: opensearch
     environment:
       - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
-      - plugins.security.ssl.http.enabled=false
-      - plugins.security.ssl.transport.enabled=false
-      - plugins.security.allow_default_init_securityindex=true
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=C@nsole47
     ports:
       - "9200:9200"
       - "9600:9600"
@@ -390,17 +435,12 @@ services:
     networks:
       - lab-network
 
+  # Дополнительно: OpenSearch Dashboards (аналог Kibana)
   dashboards:
     image: opensearchproject/opensearch-dashboards:2.13.0
     container_name: dashboards
     environment:
-      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
-      - OPENSEARCH_USERNAME=admin
-      - OPENSEARCH_PASSWORD=C@nsole47
-      # Отключаем проверку SSL в самом интерфейсе и при связи с сервером
-      - DISABLE_INSTALL_DEMO_CONFIG=true
-      - SERVER_SSL_ENABLED=false
-      - OPENSEARCH_SSL_VERIFICATIONMODE=none
+      - OPENSEARCH_HOSTS=http://opensearch:9200
     ports:
       - "5601:5601"
     depends_on:
@@ -413,9 +453,10 @@ networks:
     driver: bridge
 EOF
 
-
-chmod 777 -R opensearch-lab
-cd opensearch-lab
+# Каталог данных OpenSearch должен принадлежать UID 1000 (из-под него работает процесс
+# в контейнере), иначе контейнер упадёт с Permission denied. chmod 777 здесь не нужен и небезопасен.
+sudo chown -R 1000:1000 ~/opensearch-lab/data
+cd ~/opensearch-lab
 docker compose up -d
 
 Проверка
@@ -427,16 +468,16 @@ curl http://localhost:9200/
 
 Основные команды
 # Просмотр логов
-docker-compose logs -f opensearch
+docker compose logs -f opensearch
 
 # Остановка
-docker-compose down
+docker compose down
 
 # Перезапуск
-docker-compose restart
+docker compose restart
 
 # Проверить статус
-docker-compose ps
+docker compose ps
 
 Доступ к OpenSearch
 Адрес: http://10.0.2.30:9200
@@ -449,7 +490,10 @@ docker-compose ps
 # С kafka1.lab (10.0.2.20) проверяем:
 curl -X GET "http://10.0.2.30:9200/"
 
-# Если не работает, проверяем фаервол на 10.0.2.30:
+# Если не работает — проверяем доступность портов. Команды ниже (как и все команды раздела)
+# выполняются НА самой VM 10.0.2.30:
+# Примечание про ufw: для published-портов контейнеров Docker правила ufw обычно НЕ требуются —
+# Docker публикует порты напрямую через iptables (в обход правил ufw INPUT).
 sudo ufw allow 9200/tcp
 sudo ufw allow 5601/tcp
 
@@ -471,144 +515,4 @@ curl -X POST "http://10.0.2.30:9200/test-index/_doc/1" -H 'Content-Type: applica
 }'
 
 # Поиск
-
 curl -X GET "http://10.0.2.30:9200/test-index/_search?pretty"
-
-
-
-
-{
-  "title": "Kafka Exporter Modern Overview",
-  "uid": "kafka-exporter-modern",
-  "tags": ["kafka", "exporter", "prometheus"],
-  "timezone": "browser",
-  "schemaVersion": 36,
-  "version": 2,
-  "refresh": "10s",
-  "time": {
-    "from": "now-15m",
-    "to": "now"
-  },
-  "panels": [
-    {
-      "type": "stat",
-      "title": "Kafka Brokers",
-      "id": 1,
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "kafka_brokers",
-          "refId": "A",
-          "instant": true
-        }
-      ],
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "colorMode": "background",
-        "graphMode": "none"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Under-Replicated Partitions",
-      "id": 5,
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "sum(kafka_topic_partition_under_replicated_partition)",
-          "refId": "A",
-          "instant": true
-        }
-      ],
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "colorMode": "value"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Consumer Lag per Group",
-      "id": 2,
-      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 },
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "sum by (consumergroup) (kafka_consumergroup_lag)",
-          "legendFormat": "{{consumergroup}}",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "legend": { "displayMode": "table", "placement": "right" }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "fillOpacity": 10 },
-          "unit": "short"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Total Cluster Lag",
-      "id": 3,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 4 },
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "kafka_consumergroup_lag_sum",
-          "legendFormat": "Total Lag",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "gradientMode": "opacity" },
-          "unit": "short",
-          "color": { "mode": "fixed", "fixedColor": "orange" }
-        }
-      }
-    },
-    {
-      "type": "table",
-      "title": "Topic & Partition Details",
-      "id": 4,
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "kafka_topic_partition_current_offset",
-          "format": "table",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "footer": { "showNodes": false, "reducer": ["sum"] }
-      }
-    }
-  ]
-}

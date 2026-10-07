@@ -24,6 +24,9 @@
 │  └─────────────┘  └─────────────────┘                      │
 └─────────────────────────────────────────────────────────────┘
 
+Примечание к схеме: PostgreSQL (10.0.2.31) показан только для контекста курса —
+в ЭТОЙ лабораторной работе он не используется (мониторинг Kafka от БД не зависит).
+
 Часть 1: Подготовка окружения на VM OpenSearch (10.0.2.30)
 Шаг 1.1: Установка необходимых пакетов
 # Подключаемся к OpenSearch ноде
@@ -48,12 +51,19 @@ if ! command -v docker &> /dev/null; then
     newgrp docker
 fi
 
-# Если docker compose не установлен, устанавливаем
-if ! command -v docker compose &> /dev/null; then
-    echo "Установка Docker Compose..."
-    sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker compose
-    sudo chmod +x /usr/local/bin/docker compose
-fi
+# Проверяем наличие плагина docker compose (v2)
+docker compose version
+
+# Если плагина вдруг нет — доустановите его пакетом:
+#   sudo apt install -y docker-compose-plugin
+#
+# Почему standalone-бинарник docker-compose (v1) здесь НЕ нужен:
+# - скрипт get.docker.com (шаг выше) ставит docker-ce вместе с плагином
+#   docker-compose, т.е. команда «docker compose» уже доступна;
+# - VM 10.0.2.30 уже использует «docker compose» из лабораторной 1 (OpenSearch).
+# Раньше в этом месте был блок curl .../docker-compose-$(uname -s)-$(uname -m) —
+# он был сломан (пробел в URL и в имени файла) и смешивал standalone-бинарник
+# (docker-compose v1) с синтаксисом v2-плагина («docker compose»).
 
 Шаг 1.2: Создание структуры директорий
 # Создаем рабочую директорию
@@ -108,6 +118,15 @@ sudo systemctl start node-exporter
 # 6. Проверяем статус
 sudo systemctl status node-exporter
 
+# 7. Открываем порт 9100 в ufw для Prometheus (скрейп с 10.0.2.30)
+# В лабораторной 1 на брокерах в ufw открыты только порты 9092:9095.
+# Без этого правила Prometheus с 10.0.2.30 не достучится до node_exporter,
+# и алерты на CPU/память/диск останутся без данных («мёртвые»).
+# Порт 8083 (Kafka Connect) здесь не открываем: его джоб в prometheus.yml
+# закомментирован — у Kafka Connect нет HTTP /metrics (см. Шаг 3.2).
+sudo ufw allow from 10.0.2.30 to any port 9100 proto tcp
+sudo ufw status | grep 9100
+
 Часть 3: Развертывание стека мониторинга через Docker Compose
 Шаг 3.1: Создание docker compose.yml
 # На OpenSearch ноде (10.0.2.30) создаем docker compose файл
@@ -127,7 +146,7 @@ volumes:
 
 services:
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.54.1  # проверьте актуальные теги при подготовке курса
     container_name: prometheus
     restart: unless-stopped
     volumes:
@@ -145,7 +164,7 @@ services:
       - monitoring
 
   alertmanager:
-    image: prom/alertmanager:latest
+    image: prom/alertmanager:v0.28.0  # проверьте актуальные теги при подготовке курса
     container_name: alertmanager
     restart: unless-stopped
     volumes:
@@ -157,12 +176,14 @@ services:
       - monitoring
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.3.0  # проверьте актуальные теги при подготовке курса
     container_name: grafana
     restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin123
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+      # GF_INSTALL_PLUGINS=grafana-piechart-panel удалён: панель pie chart
+      # встроена в Grafana начиная с версии 8.3 (core-плагин), отдельная
+      # установка не нужна.
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
@@ -173,7 +194,7 @@ services:
       - monitoring
 
   kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
+    image: danielqsj/kafka-exporter:v1.6.0  # проверьте актуальные теги при подготовке курса; проверить совместимость v1.6.0 с Kafka 4.1.1 (KRaft)
     container_name: kafka-exporter
     restart: unless-stopped
     command:
@@ -232,11 +253,16 @@ scrape_configs:
       - targets: ['kafka-exporter:9308']
     metrics_path: '/metrics'
 
-  # Kafka Connect (если есть)
-  - job_name: 'kafka-connect'
-    static_configs:
-      - targets: ['10.0.2.20:8083']
-    metrics_path: '/metrics'
+  # Kafka Connect: джоб закомментирован. У Kafka Connect НЕТ HTTP-эндпоинта
+  # /metrics на REST-порту 8083 (там admin API; метрики отдаются только через
+  # JMX), поэтому скрейп сюда бессмыслен — таргет был бы вечно DOWN.
+  # Для этой лабораторной работы достаточно kafka-exporter и node_exporter;
+  # если мониторинг Connect всё же нужен — настройте отдельно jmx_exporter
+  # (и откройте его порт в ufw на ноде Kafka).
+  # - job_name: 'kafka-connect'
+  #   static_configs:
+  #     - targets: ['10.0.2.20:8083']
+  #   metrics_path: '/metrics'
 EOF
 
 Шаг 3.3: Настройка алертов для Kafka
@@ -246,18 +272,26 @@ groups:
   - name: kafka_alerts
     rules:
       # Алерт на высокий consumer lag
+      # Метрика danielqsj/kafka-exporter называется kafka_consumergroup_lag
+      # (лейблы consumergroup/topic/partition). Лаг считается по каждой
+      # партиции, поэтому агрегируем по группе и топику — иначе алерт
+      # срабатывал бы на лаг отдельной партиции.
       - alert: HighConsumerLag
         expr: |
-          kafka_consumer_lag > 1000
-        for: 5m
+          sum by (consumergroup, topic) (kafka_consumergroup_lag) > 1000
+        for: 1m  # для лабораторной работы не ждём 5 минут (иначе проверка алерта в Части 6 затянется)
         labels:
           severity: critical
           service: kafka
         annotations:
           summary: "Высокий лаг консумера"
-          description: "Consumer group имеет лаг {{ $value }} сообщений"
+          description: "Группа {{ $labels.consumergroup }} имеет суммарный лаг {{ $value }} сообщений (топик {{ $labels.topic }})"
 
       # Алерт на недоступность брокера Kafka
+      # Внимание: правило kafka_brokers < 3 НЕ надёжно — остановленный брокер
+      # часто остаётся в metadata кластера, и kafka-exporter продолжает
+      # сообщать 3. Падение ЦЕЛОЙ ноды надёжнее ловить через node_exporter:
+      # см. правило KafkaNodeDown ниже.
       - alert: KafkaBrokerDown
         expr: |
           kafka_brokers < 3
@@ -268,6 +302,20 @@ groups:
         annotations:
           summary: "Брокер Kafka недоступен"
           description: "Только {{ $value }} брокеров доступно из 3"
+
+      # Алерт на недоступность нод кластера Kafka (node_exporter не отвечает).
+      # Имя job взято из prometheus.yml: node-exporter-kafka. Если вы
+      # переименовали job в prometheus.yml — поправьте имя и здесь.
+      - alert: KafkaNodeDown
+        expr: |
+          up{job="node-exporter-kafka"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "Нода Kafka недоступна: {{ $labels.instance }}"
+          description: "Prometheus не получает метрики node_exporter с {{ $labels.instance }}"
 
       # Алерт на высокую загрузку CPU
       - alert: HighCPUUsage
@@ -304,33 +352,58 @@ groups:
         annotations:
           summary: "Высокое использование диска на {{ $labels.instance }}"
           description: "Используется {{ $value | humanizePercentage }} дискового пространства"
+
+      # Алерт на сам мониторинг: если цель скрейпа (экспортёр или сам
+      # Prometheus) недоступна — сообщаем об этом явно. Без такого правила
+      # «молчание» метрик можно принять за отсутствие проблем.
+      - alert: MonitoringTargetsDown
+        expr: |
+          up{job=~"prometheus|kafka-exporter|node-exporter-kafka"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: monitoring
+        annotations:
+          summary: "Цель мониторинга недоступна: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Prometheus не получает метрики с джоба {{ $labels.job }} ({{ $labels.instance }})"
 EOF
 
 Шаг 3.4: Настройка Alertmanager
 # Создаем конфигурацию Alertmanager
 mkdir -p alertmanager
 cat > alertmanager/alertmanager.yml << 'EOF'
-global:
-  smtp_smarthost: 'mail.netangels.ru:587'
-  smtp_from: 'alert@iklimarev.ru'
-  smtp_auth_username: 'alert@iklimarev.ru'
-  smtp_auth_password: 'your-app-password'
-  smtp_require_tls: true
+# Нейтральная конфигурация для лабораторной работы: реальная доставка
+# уведомлений (почта/вебхуки) здесь НЕ настраивается и НЕ проверяется.
+#
+# Чтобы получать реальные письма, добавьте в этот файл свой SMTP, например:
+# global:
+#   smtp_smarthost: '<ваш_smtp_сервер>:587'
+#   smtp_from: '<ваш_email>'
+#   smtp_auth_username: '<ваш_email>'
+#   smtp_auth_password: '<ваш_пароль>'
+#   smtp_require_tls: true
+# ...
+# receivers:
+#   - name: 'webhook-null'
+#     email_configs:
+#       - to: '<ваш_email>'
+#         send_resolved: true
 
 route:
   group_by: ['alertname', 'severity']
   group_wait: 10s
   group_interval: 10s
   repeat_interval: 1h
-  receiver: 'default-receiver'
+  receiver: 'webhook-null'
 
 receivers:
-  - name: 'default-receiver'
-    email_configs:
-      - to: 'admin@example.com'
-        send_resolved: true
-
-# Для тестирования можно использовать простую конфигурацию без SMTP
+  # Нейтральный receiver (без notifier'ов): алерты принимаются и «гаснут»
+  # никуда не отправляясь. Приём проверяется через API Alertmanager (Часть 6).
+  # При необходимости замените на свой вебхук, например:
+  # - name: 'webhook-null'
+  #   webhook_configs:
+  #     - url: 'http://localhost:5000/alert'
+  - name: 'webhook-null'
 EOF
 
 # Альтернативная конфигурация для тестирования
@@ -341,6 +414,16 @@ route:
 receivers:
   - name: 'null'
 EOF
+
+# (Опционально, выполняется ПОСЛЕ запуска стека — Часть 5) Проверка приёма
+# алертов БЕЗ SMTP: временно подставьте тестовый конфиг вместо основного и
+# перезапустите контейнер Alertmanager:
+#   cp alertmanager/alertmanager-test.yml alertmanager/alertmanager.yml
+#   docker compose restart alertmanager
+# Так проверяется только ПРИЁМ алертов Alertmanager'ом (через его API),
+# а НЕ доставка писем — доставка в лабораторной работе не проверяется.
+# После проверки верните основной конфиг (повторите команду «cat > ...»
+# из этого шага) и снова выполните docker compose restart alertmanager.
 
 Часть 4: Настройка Grafana и дашбордов
 Шаг 4.1: Создание provisioning конфигурации для Grafana
@@ -354,6 +437,7 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: prometheus  # uid фиксируем, чтобы на него можно было ссылаться из дашбордов (объектная форма datasource)
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -387,8 +471,8 @@ cat > grafana/dashboards/kafka-overview.json << 'EOF'
       "type": "graph",
       "targets": [
         {
-          "expr": "kafka_consumer_lag",
-          "legendFormat": "{{group}}"
+          "expr": "sum by (consumergroup, topic) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}} / {{topic}}"
         }
       ]
     },
@@ -431,25 +515,12 @@ EOF
 cat > download-dashboards.sh << 'EOF'
 #!/bin/bash
 
+# Ревизии дашбордов зафиксированы (…/revisions/N): если скачанный дашборд
+# несовместим с вашей версией Grafana — проверьте актуальную ревизию
+# на grafana.com (ID 7589 / 1860 / 3662).
+
 # Дашборд для Kafka Exporter (ID: 7589)
 wget -O grafana/dashboards/kafka-exporter.json https://grafana.com/api/dashboards/7589/revisions/1/download
-
-Важно: дашборд “Kafka Exporter (ID: 7589)” использует переменные job и instance,
-которые по умолчанию определяются через метрику
-kafka_consumergroup_current_offset. В используемой в лабораторной работе
-версии kafka-exporter эта метрика отсутствует, поэтому переменные job и
-instance в верхней части дашборда могут оставаться пустыми, а часть панелей —
-без данных. Это не является ошибкой конфигурации Prometheus или kafka-exporter.
-
-Основная проверка работы kafka-exporter в рамках лабораторной работы:
-- команда:
-  curl -s http://localhost:9308/metrics | grep -E "kafka_consumer_lag|kafka_brokers" | head -5
-  должна показать метрики kafka_brokers и kafka_consumer_lag;
-- в Prometheus по запросу kafka_brokers должно отображаться значение 3;
-- дашборд “Kafka Cluster Overview” (kafka-overview.json) должен показывать
-  количество брокеров, сообщения в секунду и лаг консумеров.
-
-
 
 # Дашборд для Node Exporter (ID: 1860)
 wget -O grafana/dashboards/node-exporter-full.json https://grafana.com/api/dashboards/1860/revisions/22/download
@@ -461,6 +532,23 @@ EOF
 chmod +x download-dashboards.sh
 ./download-dashboards.sh
 
+Важно: дашборд «Kafka Exporter (ID: 7589)» использует переменные job и instance,
+которые по умолчанию определяются через метрику kafka_consumergroup_current_offset.
+Эта метрика у danielqsj/kafka-exporter СУЩЕСТВУЕТ и появляется, когда хотя бы одна
+consumer group закоммитила свои offset'ы. Если на момент импорта таких групп нет,
+переменные job и instance в верхней части дашборда остаются пустыми, а часть панелей —
+без данных. Это НЕ ошибка конфигурации Prometheus или kafka-exporter: запустите
+консьюмера с группой и закоммитьте offset'ы (Часть 6) — дашборд наполнится данными.
+
+Основная проверка работы kafka-exporter (выполняется на 10.0.2.30 ПОСЛЕ запуска
+стека в Части 5; ниже продублирована в шагах 5.2 и 6.1):
+- команда
+  curl -s http://localhost:9308/metrics | grep -E "kafka_consumergroup_lag|kafka_brokers" | head -5
+  должна показать метрики kafka_brokers и kafka_consumergroup_lag;
+- в Prometheus по запросу kafka_brokers должно отображаться значение 3;
+- дашборд «Kafka Cluster Overview» (kafka-overview.json) должен показывать
+  количество брокеров, сообщения в секунду и лаг консумеров.
+
 # Исправляем источники данных в скачанных дашбордах
 for file in grafana/dashboards/*.json; do
     if [ -f "$file" ]; then
@@ -468,6 +556,15 @@ for file in grafana/dashboards/*.json; do
         sed -i 's/"datasource": "[^"]*"/"datasource": "Prometheus"/g' "$file"
     fi
 done
+
+# Примечание: sed заменяет ТОЛЬКО строковую форму "datasource": "...".
+# Если в JSON источник данных задан объектной формой {"type": "prometheus",
+# "uid": "..."} — sed её не тронет, и панели останутся без источника данных.
+# Такой файл поправьте вручную или через jq, например (заменяет uid у всех
+# объектов datasource на uid нашего источника — см. datasource.yml):
+#   jq 'walk(if type == "object" and has("datasource") and (.datasource | type) == "object"
+#            then .datasource.uid = "prometheus" else . end)' \
+#      grafana/dashboards/example.json > /tmp/dash.json && mv /tmp/dash.json grafana/dashboards/example.json
 
 кастомный дашбоард
 # Создаем кастомный дашборд для kafka-exporter
@@ -528,8 +625,8 @@ cat > grafana/dashboards/kafka-exporter-custom.json << 'EOF'
       "linewidth": 1,
       "targets": [
         {
-          "expr": "kafka_consumer_lag",
-          "legendFormat": "{{group}}",
+          "expr": "kafka_consumergroup_lag",
+          "legendFormat": "{{consumergroup}} / {{topic}} / {{partition}}",
           "refId": "A"
         }
       ],
@@ -548,7 +645,7 @@ cat > grafana/dashboards/kafka-exporter-custom.json << 'EOF'
       "linewidth": 1,
       "targets": [
         {
-          "expr": "sum(kafka_consumer_lag)",
+          "expr": "sum(kafka_consumergroup_lag)",
           "legendFormat": "total lag",
           "refId": "A"
         }
@@ -566,7 +663,7 @@ cat > grafana/dashboards/kafka-exporter-custom.json << 'EOF'
       "datasource": "Prometheus",
       "targets": [
         {
-          "expr": "kafka_consumer_lag",
+          "expr": "kafka_consumergroup_lag",
           "refId": "A"
         }
       ],
@@ -606,6 +703,14 @@ docker compose up -d
 # Проверяем статус контейнеров
 docker compose ps
 
+# Примечание про firewall на 10.0.2.30: порты контейнеров (9090, 3000, 9093,
+# 9308) опубликованы на всех интерфейсах VM. Для published-портов Docker
+# отдельное правило ufw обычно НЕ требуется — трафик идёт через цепочки
+# iptables/DOCKER напрямую. Но если со своей рабочей станции порты
+# недоступны (например, на 10.0.2.30 включён ufw с deny-политикой), добавьте
+# правило явно:
+#   sudo ufw allow 9090,3000,9093,9308/tcp
+
 # Просматриваем логи
 docker compose logs -f --tail=50
 
@@ -613,23 +718,32 @@ docker compose logs -f --tail=50
 # Проверяем Prometheus
 curl -s http://localhost:9090/api/v1/status/config | jq .status
 
-# Проверяем Alertmanager
-curl -s http://localhost:9093/api/v1/status
+# Проверяем Alertmanager (HTTP API v2)
+curl -s http://localhost:9093/api/v2/status
 
 # Проверяем Grafana
 curl -s http://localhost:3000/api/health
 
-# Проверяем kafka-exporter
-curl -s http://localhost:9308/metrics | grep -E "(kafka_consumer_lag|kafka_brokers)" | head -5
+# Проверяем kafka-exporter (метрика лага называется kafka_consumergroup_lag)
+curl -s http://localhost:9308/metrics | grep -E "(kafka_consumergroup_lag|kafka_brokers)" | head -5
 
 Шаг 5.3: Настройка Grafana
 # Открываем Grafana в браузере: http://10.0.2.30:3000
 # Логин: admin, пароль: admin123
 
-# 1. Проверяем, что источник данных Prometheus добавлен
-# 2. Импортируем дашборды через веб-интерфейс:
-#    - Нажимаем "+" -> Import
-#    - Загружаем файлы из ~/kafka-monitoring/grafana/dashboards/
+# 1. Проверяем, что источник данных Prometheus добавлен:
+#    Connections -> Data sources -> Prometheus (Health check должен быть OK)
+
+# 2. Дашборды НЕ нужно импортировать вручную: файлы из папки
+#    ~/kafka-monitoring/grafana/dashboards/ уже загружены автоматически через
+#    provisioning (grafana/provisioning/dashboards/dashboards.yml, путь
+#    /var/lib/grafana/dashboards). Откройте Dashboards в боковом меню и
+#    найдите: Kafka Cluster Overview, Kafka Exporter Overview (Custom),
+#    а также скачанные скриптом дашборды (Kafka Exporter, Node Exporter Full,
+#    Prometheus Overview).
+#    НЕ импортируйте эти же файлы вручную через "+" -> Import: при импорте
+#    тех же uid возникнет конфликт, и provisioning перезапишет ручную копию
+#    при перезапуске Grafana.
 
 Часть 6: Тестирование мониторинга и алертов
 Шаг 6.1: Тестирование сбора метрик
@@ -639,45 +753,128 @@ curl -s "http://localhost:9090/api/v1/label/__name__/values" | jq -r '.data[]' |
 
 # 2. Проверяем метрики consumer lag
 echo "=== Метрики Consumer Lag ==="
-curl -s "http://localhost:9090/api/v1/query?query=kafka_consumer_lag" | jq .
+curl -s "http://localhost:9090/api/v1/query?query=kafka_consumergroup_lag" | jq .
 
 # 3. Проверяем состояние алертов
 echo "=== Активные алерты ==="
 curl -s "http://localhost:9090/api/v1/alerts" | jq .
 
-Шаг 6.2: Создание тестовой нагрузки для проверки алертов
-# На kafka1 создаем тестовый топик и генерируем данные
+Шаг 6.2: Детерминированный тест алерта HighConsumerLag
+# Сценарий: consumer группы читает ТОЛЬКО новые сообщения (auto.offset.reset=
+# latest, БЕЗ --from-beginning) и по ограничению --max-messages 100 завершается,
+# успев прочитать лишь малую часть потока. Продюсер тем временем пишет 10000
+# сообщений с ограниченным throughput → суммарный лаг группы гарантированно
+# вырастает (end-offset ~10000 против закоммиченных ~100).
+
+# --- Выполняется на ноде kafka1 ---
 ssh kafka1
 
-# Создаем тестовый топик
+# Создаем тестовый топик (RF=3 — единообразие курса)
 /opt/kafka/bin/kafka-topics.sh --create \
   --topic test-monitoring \
   --partitions 3 \
-  --replication-factor 2 \
+  --replication-factor 3 \
   --bootstrap-server localhost:9092
 
-# Запускаем producer для генерации данных
-/opt/kafka/bin/kafka-producer-perf-test.sh \
-  --topic test-monitoring \
-  --num-records 10000 \
-  --record-size 1000 \
-  --throughput 1000 \
-  --producer-props bootstrap.servers=localhost:9092
-
-# В другом терминале запускаем медленного consumer
+# 1) Запускаем consumer группы в фоне. Роль «медленного» consumer'а играет
+#    ограничение --max-messages 100: он прочитает 100 сообщений и завершится,
+#    а группа останется с закоммиченными offset'ами. Автокоммит включаем явно
+#    (интервал 1 с), чтобы offset'ы гарантированно закоммитились, пока consumer жив.
 /opt/kafka/bin/kafka-console-consumer.sh \
   --topic test-monitoring \
   --bootstrap-server localhost:9092 \
   --group test-monitoring-group \
   --max-messages 100 \
-  --timeout-ms 60000
+  --timeout-ms 60000 \
+  --consumer-property enable.auto.commit=true \
+  --consumer-property auto.commit.interval.ms=1000 \
+  > /tmp/consumer-test-monitoring.log 2>&1 &
 
-# Проверяем метрики lag через kafka-exporter
+# 2) Даем consumer'у 5 секунд, чтобы он присоединился к группе
+sleep 5
+
+# 3) Запускаем producer: 10000 сообщений с throughput ~500/с (окно ~20 секунд).
+#    Consumer уже «в группе», но успеет прочитать только свои 100 сообщений —
+#    лаг группы будет расти всё время, пока пишет продюсер.
+/opt/kafka/bin/kafka-producer-perf-test.sh \
+  --topic test-monitoring \
+  --num-records 10000 \
+  --record-size 1000 \
+  --throughput 500 \
+  --producer-props bootstrap.servers=localhost:9092
+
+# 4) Ждем завершения фонового consumer'а и смотрим, что он прочитал
+wait
+tail -3 /tmp/consumer-test-monitoring.log
+# Ожидание: "Processed a total of 100 messages"
+
+# Выходим с kafka1 (проверки ниже выполняются на 10.0.2.30)
+exit
+
+# --- Выполняется на 10.0.2.30 ---
+
+# 5) Проверяем, что kafka-exporter видит лаг группы. Метрика называется
+#    kafka_consumergroup_lag (лейбл consumergroup="test-monitoring-group"),
+#    kafka-exporter слушает только на 10.0.2.30 — поэтому и curl здесь.
 curl -s http://localhost:9308/metrics | grep "test-monitoring-group"
+# Ожидание: строки вида
+#   kafka_consumergroup_lag{consumergroup="test-monitoring-group",topic="test-monitoring",partition="0"} 3.3e3
+# Сумма по трём партициям заметно больше порога 1000.
+
+# 6) Ждем ~70 секунд и проверяем, что алерт HighConsumerLag перешёл в firing.
+#    Правило имеет for: 1m — алерт переходит в firing только после минуты
+#    непрерывного превышения порога (сначала он будет в состоянии pending).
+sleep 70
+
+# Проверяем в Prometheus
+curl -s "http://localhost:9090/api/v1/alerts" | jq '.data.alerts[] | select(.labels.alertname == "HighConsumerLag") | {state, labels, annotations}'
+# Ожидание: "state": "firing"
+
+# Проверяем в Alertmanager (HTTP API v2)
+curl -s "http://localhost:9093/api/v2/alerts" | jq '.[] | select(.labels.alertname == "HighConsumerLag") | {status: .status.state, labels}'
+# Ожидание: "status": "active" — алерт принят Alertmanager'ом
+
+# 7) Проверяем resolved: даем группе «догнать». Consumer той же группы
+#    продолжит с закоммиченного offset'а и дочитает оставшиеся ~9900 сообщений —
+#    лаг упадёт до нуля, алерт уйдёт из активных.
+# --- Выполняется на ноде kafka1 ---
+ssh kafka1
+
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic test-monitoring \
+  --bootstrap-server localhost:9092 \
+  --group test-monitoring-group \
+  --max-messages 100000 \
+  --timeout-ms 10000 \
+  --consumer-property enable.auto.commit=true \
+  --consumer-property auto.commit.interval.ms=1000
+# Consumer дочитает все накопленные сообщения и завершится сам (10 секунд
+# без новых данных). Если алерт ещё не resolved — повторите запуск: consumer
+# продолжит с последнего закоммиченного offset'а и дочитает остаток.
+
+# Выходим с kafka1
+exit
+
+# --- Выполняется на 10.0.2.30 ---
+# 8) Через ~30 секунд проверяем, что активных алертов HighConsumerLag нет:
+sleep 30
+curl -s "http://localhost:9090/api/v1/alerts" | jq '.data.alerts[] | select(.labels.alertname == "HighConsumerLag")'
+# Ожидание: пустой результат (алерт resolved, убран из активных)
 
 Шаг 6.3: Мониторинг алертов в Alertmanager
-# Проверяем алерты в Alertmanager
-curl -s http://localhost:9093/api/v1/alerts | jq .
+# Проверяем активные алерты в Alertmanager (HTTP API v2)
+curl -s http://localhost:9093/api/v2/alerts | jq .
+
+# (Опционально) Если вы хотите убедиться, что Alertmanager принимает алерты
+# БЕЗ настройки SMTP — временно подставьте тестовый конфиг (receiver 'null')
+# вместо основного и перезапустите контейнер:
+#   cp alertmanager/alertmanager-test.yml alertmanager/alertmanager.yml
+#   docker compose restart alertmanager
+# Так проверяется только ПРИЁМ алертов Alertmanager'ом (через его API),
+# а НЕ доставка писем — доставка в лабораторной работе не настраивается
+# и не проверяется. После проверки верните основной конфиг (повторите
+# команду «cat > alertmanager/alertmanager.yml» из Шага 3.4) и снова
+# выполните docker compose restart alertmanager.
 
 # Создаем тестовый алерт
 cat > test-alert.json << 'EOF'
@@ -696,10 +893,61 @@ cat > test-alert.json << 'EOF'
 ]
 EOF
 
-# Отправляем тестовый алерт
+# Отправляем тестовый алерт (API v2)
 curl -X POST -H "Content-Type: application/json" \
   --data @test-alert.json \
-  http://localhost:9093/api/v1/alerts
+  http://localhost:9093/api/v2/alerts
+
+# Проверяем, что тестовый алерт принят
+curl -s http://localhost:9093/api/v2/alerts | jq '.[] | select(.labels.alertname == "TestAlert") | {status: .status.state, labels}'
+
+Шаг 6.4: Тест алертов на недоступность брокера/ноды
+# Проверяем, как правила KafkaBrokerDown и KafkaNodeDown реагируют на падение.
+# --- Выполняется на одной из нод Kafka (например kafka2) ---
+ssh kafka2
+
+# Останавливаем брокер Kafka на ноде
+sudo systemctl stop kafka
+
+# Выходим с kafka2
+exit
+
+# --- Выполняется на 10.0.2.30 ---
+# Ждем ~2,5 минуты (правила имеют for: 1m, интервал оценки Prometheus — 15 с)
+# и смотрим состояние алертов:
+sleep 150
+curl -s "http://localhost:9090/api/v1/alerts" | jq '.data.alerts[] | select(.labels.alertname == "KafkaBrokerDown" or .labels.alertname == "KafkaNodeDown") | {state, labels}'
+
+# Ожидания (важно понимать заранее):
+# - KafkaBrokerDown может НЕ перейти в firing: остановленный брокер часто
+#   остаётся в metadata кластера, и kafka-exporter продолжает показывать
+#   kafka_brokers = 3. Это ограниченность правила — см. комментарий в alerts.yml;
+# - KafkaNodeDown тоже молчит: нода (и node_exporter на ней) жива.
+# Чтобы увидеть firing правила KafkaNodeDown, остановите node_exporter на той
+# же ноде (эмуляция падения цели скрейпа):
+# --- Выполняется на kafka2 ---
+#   ssh kafka2
+#   sudo systemctl stop node-exporter
+#   exit
+# --- Выполняется на 10.0.2.30 ---
+#   sleep 90
+#   curl -s "http://localhost:9090/api/v1/alerts" | jq '.data.alerts[] | select(.labels.alertname == "KafkaNodeDown") | {state, labels}'
+# Ожидание: KafkaNodeDown перешёл в firing.
+
+# Возвращаем всё на место.
+# --- Выполняется на kafka2 ---
+ssh kafka2
+
+sudo systemctl start node-exporter  # если останавливали в опциональном шаге выше
+sudo systemctl start kafka
+
+# Выходим с kafka2
+exit
+
+# --- Выполняется на 10.0.2.30 ---
+# Через ~2 минуты убеждаемся, что кластер снова в порядке (kafka_brokers = 3):
+sleep 120
+curl -s "http://localhost:9090/api/v1/query?query=kafka_brokers" | jq .data.result
 
 Часть 7: Очистка и завершение работы
 Шаг 7.1: Команды для остановки мониторинга

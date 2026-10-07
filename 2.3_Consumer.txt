@@ -10,11 +10,42 @@
 3. Топик с данными для потребления (создадим)
 
 # ============================================
+# ⚠️ ПОДГОТОВКА ОКРУЖЕНИЯ — ОБЯЗАТЕЛЬНО В НОВОЙ SSH-СЕССИИ
+# ============================================
+# Python-окружение (venv с confluent-kafka, faker и rich) было создано в
+# Лабораторной 2.2 в каталоге ~/kafka-lab/producers. Если вы открыли НОВУЮ
+# SSH-сессию (или перезагрузили машину) — venv НЕ активирован, и python3
+# запустит системный интерпретатор БЕЗ confluent_kafka и rich: скрипты
+# упадут с ModuleNotFoundError, а создаваемые *.py окажутся не в том каталоге.
+# Выполните блок ниже и только потом продолжайте лабораторную.
+
+# 1. Подключитесь к kafka1.lab (команда выполняется с вашей рабочей машины)
+ssh kafka1.lab
+
+# 2. Перейдите в каталог лабы и активируйте виртуальное окружение из лабы 2.2
+cd ~/kafka-lab/producers
+source venv/bin/activate
+
+# 3. Проверка окружения: python3 должен импортировать confluent_kafka и rich
+python3 -c "import confluent_kafka, rich; print('OK')"
+# Ожидаемый вывод: OK
+# Если вместо OK вы видите ModuleNotFoundError — venv отсутствует или
+# повреждён. Создайте окружение заново (как в лабе 2.2):
+#   python3 -m venv venv && source venv/bin/activate && pip install confluent-kafka faker rich
+# и повторите проверку: python3 -c "import confluent_kafka, rich; print('OK')"
+
+# ============================================
 # 0. ПОДГОТОВКА ОКРУЖЕНИЯ И ПРОВЕРКА
 # ============================================
 
 echo "🔍 Проверка и подготовка окружения..."
 echo "Создаем скрипт для настройки демонстрации..."
+# ЧТО ДЕЛАЕМ: скрипт создаёт топик user-actions (6 партиций, RF=3) и наполняет его
+#   5000 тестовых сообщений — это общий «полигон» для всех следующих демо.
+# ЗАЧЕМ: все остальные скрипты (консюмеры, группы, ребалансировка) читают именно этот
+#   топик — нужен общий источник данных с заранее известной структурой.
+# ПОЧЕМУ ТАК: 6 партиций делятся поровну между 1, 2 или 3 консюмерами (6/1, 6/2, 6/3) —
+#   это делает ребалансировку наглядной на следующих шагах.
 
 cat > setup_demo.py << 'EOF'
 #!/usr/bin/env python3
@@ -176,7 +207,7 @@ def main():
             print("  1. python3 basic_consumer.py")
             print("  2. python3 manual_commit_consumer.py --id consumer-1")
             print("  3. python3 consumer_group_demo.py")
-            print("  4. python3 error_handling_consumer.py")
+            print("  4. python3 error_handling_consumer.py --produce --messages 30")
             print("  5. python3 rebalance_test.py")
         else:
             print("❌ Не удалось создать тестовые сообщения")
@@ -201,12 +232,22 @@ echo "На вопрос о создании сообщений ответьте 
 echo "После успешной настройки можно продолжать лабораторную работу."
 echo ""
 read -p "Нажмите Enter, когда будете готовы продолжить..." dummy
+# ОЖИДАЕМЫЙ ВЫВОД: топик создан, describe показывает 6 партиций с Replicas:1,2,3,
+#   затем "Отправлено 5000 сообщений".
+# НА ЧТО СМОТРЕТЬ: у 6 партиций лидеры РАЗНЫЕ (распределены по брокерам 1–3) — это и
+#   есть балансировка нагрузки, вокруг которой строится вся лаба.
 
 # ============================================
 # 1. БАЗОВЫЙ КОНСЮМЕР (АВТОКОММИТ)
 # ============================================
 
 echo "Создаем базовый консюмер с автокоммитом..."
+# ЧТО ДЕЛАЕМ: консюмер с АВТОкоммитом offset — читает 100 сообщений из user-actions.
+# ЗАЧЕМ: отправная точка — понять, что offset по умолчанию коммитится сам (раз в 5 с),
+#   и увидеть главный риск: коммит происходит НЕЗАВИСИМО от того, обработано ли сообщение.
+# ПОЧЕМУ ТАК: enable.auto.commit=True + interval 5000 мс — дефолт «из коробки», простой,
+#   но при падении приложения часть обработанных сообщений может быть потеряна (коммит
+#   уже ушёл, а результат не сохранён) либо прочитана повторно.
 
 cat > basic_consumer.py << 'EOF'
 #!/usr/bin/env python3
@@ -361,6 +402,14 @@ class BasicConsumer:
         
         message_count = 0
         
+        # Таймаут без данных: если 60 секунд не пришло НИ ОДНОГО сообщения
+        # (топик пуст или offset'ы группы уже закоммичены с прошлого запуска),
+        # выходим с подсказкой. Иначе консюмер крутился бы вечно: выход в этом
+        # скрипте только по max_messages, а enable.partition.eof не включён,
+        # поэтому ветка «конец партиции» ниже не срабатывает.
+        NO_DATA_TIMEOUT = 60
+        no_data_since = time.time()
+        
         with Progress() as progress:
             task = progress.add_task("Потребление сообщений...", total=max_messages)
             
@@ -374,7 +423,19 @@ class BasicConsumer:
                     msg = self.consumer.poll(timeout=1.0)
                     
                     if msg is None:
+                        # Сообщений нет — проверяем, не пора ли выйти по таймауту
+                        if time.time() - no_data_since > NO_DATA_TIMEOUT:
+                            console.print(f"\n[yellow]⚠️  Нет сообщений дольше {NO_DATA_TIMEOUT} секунд — завершаюсь[/yellow]")
+                            console.print("[yellow]📌 Проверьте, что продюсер работает, или сбросьте offset'ы группы:[/yellow]")
+                            console.print("[yellow]   /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \\[/yellow]")
+                            console.print(f"[yellow]     --group {self.config['group.id']} --reset-offsets --to-earliest --execute --topic {self.topic}[/yellow]")
+                            console.print("[yellow]   либо пересоздайте данные: python3 setup_demo.py[/yellow]")
+                            self.running = False
+                            break
                         continue
+                    
+                    # Сообщение (или событие ошибки) получено — сбрасываем таймер
+                    no_data_since = time.time()
                     
                     if msg.error():
                         if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -455,12 +516,23 @@ EOF
 
 echo "Запускаем базовый консюмер..."
 python3 basic_consumer.py
+# ОЖИДАЕМЫЙ ВЫВОД: 100 сообщений с полями Partition/Offset/Key/Action, затем итоговая
+#   статистика (обработано / ошибок / скорость).
+# НА ЧТО СМОТРЕТЬ: один и тот же ключ всегда попадает в одну партицию (видно по колонке
+#   Partition). Консюмер завершился сам по лимиту 100 — он НЕ прочитал весь топик (там
+#   5000), это нормально для демонстрации.
 
 # ============================================
 # 2. КОНСЮМЕР С РУЧНЫМ КОММИТОМ OFFSET
 # ============================================
 
 echo "Создаем консюмер с ручным коммитом offset..."
+# ЧТО ДЕЛАЕМ: консюмер с РУЧНЫМ коммитом offset + retry + DLQ-файл.
+# ЗАЧЕМ: автокоммит (шаг 1) подтверждает offset ДО обработки — при сбое часть сообщений
+#   теряется. Ручной коммит даёт приложению контроль над МОМЕНТОМ подтверждения.
+# ПОЧЕМУ ТАК: enable.auto.commit=False + явный commit() ПОСЛЕ обработки = семантика
+#   at-least-once (возможны дубли, но НЕ потери). Коммит выполняется в главном потоке,
+#   потому что Consumer не потокобезопасен — коммитить из фонового таймера нельзя.
 
 cat > manual_commit_consumer.py << 'EOF'
 #!/usr/bin/env python3
@@ -468,24 +540,34 @@ cat > manual_commit_consumer.py << 'EOF'
 КОНСЮМЕР С РУЧНЫМ УПРАВЛЕНИЕМ OFFSET (MANUAL COMMIT)
 
 Что демонстрирует этот скрипт:
-1. Ручной коммит offset для гарантии exactly-once семантики
+1. Ручной коммит offset (enable.auto.commit = False) — приложение само решает,
+   когда подтвердить обработку
 2. Обработку сообщений с повторными попытками (retry logic)
 3. Callback'и для ребалансировки (on_assign, on_revoke, on_lost)
 4. Dead Letter Queue (DLQ) для неудачных сообщений
-5. Thread-safe операции с блокировками
+5. Защиту разделяемого состояния блокировкой (threading.Lock)
 
 Концепции Kafka:
 - Ручной коммит offset (enable.auto.commit = False)
 - Consumer rebalance callbacks
-- Exactly-once обработка сообщений
+- Гарантии доставки: at-least-once + DLQ (НЕ exactly-once!)
 - Partition assignment strategies
 - Обработка ошибок с экспоненциальной задержкой
 
+ВАЖНО про гарантии доставки (честная формулировка):
+- Этот скрипт НЕ реализует exactly-once. Реальная семантика — at-least-once + DLQ:
+  * при крэше МЕЖДУ обработкой сообщения и коммитом offset сообщение будет
+    перечитано после рестарта (возможны дубликаты) — это at-least-once;
+  * сообщения, упавшие после всех попыток, уходят в DLQ-файл, а их offset
+    молча «перепрыгивается» последующим коммитом — для таких сообщений
+    фактически действует at-most-once (после рестарта они не перечитываются);
+  * настоящий exactly-once требует транзакционного продюсера/консюмера
+    (Kafka transactions) и в этой лабораторной не реализуется.
+
 Особенности:
-- Гарантирует что каждое сообщение будет обработано ровно один раз
 - Требует явного вызова consumer.commit()
-- Сложнее в реализации, но надежнее
-- Подходит для финансовых транзакций и критичных данных
+- Сложнее в реализации, но даёт контроль над моментом подтверждения
+- Подходит для задач, где важна доставка без потерь, но допустимы редкие дубликаты
 
 Запуск:
 python3 manual_commit_consumer.py --id consumer-1 --messages 50
@@ -569,10 +651,13 @@ class ManualCommitConsumer:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        # Таймер для периодического коммита
-        self.commit_timer = threading.Timer(10.0, self.periodic_commit)
-        self.commit_timer.daemon = True
-        self.commit_timer.start()
+        # ВАЖНО: confluent-kafka Consumer НЕ потокобезопасен — коммит нельзя
+        # вызывать из фонового threading.Timer, пока главный поток в poll().
+        # Поэтому периодический коммит выполняется ЗДЕСЬ ЖЕ, в главном цикле
+        # consume(): по расписанию (каждые commit_interval_sec секунд) или
+        # после накопления достаточного числа сообщений.
+        self.last_commit_time = time.time()
+        self.commit_interval_sec = 10
     
     def signal_handler(self, signum, frame):
         """Обработчик сигналов"""
@@ -618,8 +703,11 @@ class ManualCommitConsumer:
                 value = msg.value().decode('utf-8')
                 data = json.loads(value)
                 
-                # Имитация обработки (может упасть с вероятностью 5%)
-                if attempt == 0 and time.time() % 100 < 5:  # 5% вероятность ошибки
+                # Имитация обработки: ~5% сообщений — «отравленные» (hash(event_id)
+                # стабилен в рамках процесса), поэтому они падают на КАЖДОЙ попытке
+                # и после исчерпания ретраев уходят в DLQ-файл. Остальные 95%
+                # обрабатываются с первой попытки.
+                if hash(data.get('event_id', '')) % 100 < 5:
                     raise Exception("Симулированная ошибка обработки")
                 
                 # Успешная обработка
@@ -690,7 +778,10 @@ class ManualCommitConsumer:
                 if not offsets:
                     continue
                 
-                # Находим максимальный offset для каждой партиции
+                # Находим максимальный offset для каждой партиции.
+                # NB: сообщения, упавшие после всех попыток, в pending НЕ попадают
+                # (они ушли в DLQ-файл), поэтому их offset будет «перепрыгнут»
+                # этим коммитом — для них семантика at-most-once (см. докстринг).
                 max_offset = max(offsets.keys())
                 offsets_to_commit.append(
                     TopicPartition(self.topic, partition, max_offset + 1)
@@ -714,18 +805,13 @@ class ManualCommitConsumer:
                     # Очищаем pending offsets
                     self.pending_offsets.clear()
                     
+                    # Обновляем время последнего коммита (для коммита по
+                    # расписанию из главного цикла consume)
+                    self.last_commit_time = time.time()
+                    
                 except Exception as e:
                     console.print(f"[red]❌ [{self.consumer_id}] Ошибка коммита: {e}[/red]")
                     self.stats['commits_failed'] += 1
-    
-    def periodic_commit(self):
-        """Периодический коммит (каждые 10 секунд)"""
-        if self.running:
-            self.commit_offsets()
-            # Перезапускаем таймер
-            self.commit_timer = threading.Timer(10.0, self.periodic_commit)
-            self.commit_timer.daemon = True
-            self.commit_timer.start()
     
     def consume(self, max_messages=None):
         """
@@ -749,12 +835,35 @@ class ManualCommitConsumer:
         
         message_count = 0
         
+        # Таймаут без данных: выходим, если NO_DATA_TIMEOUT секунд не пришло
+        # ни одного сообщения (иначе при пустом или полностью потреблённом
+        # топике цикл крутился бы вечно — выход только по max_messages).
+        NO_DATA_TIMEOUT = 60
+        no_data_since = time.time()
+        
         try:
             while self.running and (max_messages is None or message_count < max_messages):
                 msg = self.consumer.poll(timeout=1.0)
                 
                 if msg is None:
+                    # Коммит по расписанию: время истекло, а новых сообщений нет.
+                    # Раньше это делал фоновый threading.Timer, но Consumer не
+                    # потокобезопасен — коммитим здесь же, в главном цикле.
+                    if time.time() - self.last_commit_time >= self.commit_interval_sec:
+                        self.commit_offsets()
+                    
+                    # Нет данных дольше таймаута — выходим с подсказкой
+                    if time.time() - no_data_since > NO_DATA_TIMEOUT:
+                        console.print(f"\n[yellow]⚠️  [{self.consumer_id}] Нет сообщений дольше {NO_DATA_TIMEOUT} секунд — завершаюсь[/yellow]")
+                        console.print("[yellow]📌 Проверьте, что продюсер работает, или сбросьте offset'ы группы:[/yellow]")
+                        console.print("[yellow]   /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \\[/yellow]")
+                        console.print(f"[yellow]     --group {self.config['group.id']} --reset-offsets --to-earliest --execute --topic {self.topic}[/yellow]")
+                        self.running = False
+                        break
                     continue
+                
+                # Сообщение (или событие ошибки) получено — сбрасываем таймер
+                no_data_since = time.time()
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -770,8 +879,11 @@ class ManualCommitConsumer:
                 if self.process_message_with_retry(msg):
                     message_count += 1
                     
-                    # Периодически коммитим (каждые 10 сообщений)
-                    if message_count % 10 == 0:
+                    # Коммитим по расписанию: каждые 10 сообщений ИЛИ раз в
+                    # commit_interval_sec секунд. Время проверяем прямо в потоке
+                    # консюмера — без фоновых таймеров.
+                    if (message_count % 10 == 0) or \
+                       (time.time() - self.last_commit_time >= self.commit_interval_sec):
                         self.commit_offsets()
                     
                     # Показываем статистику каждые 50 сообщений
@@ -819,10 +931,6 @@ class ManualCommitConsumer:
         # Коммитим все оставшиеся offsets
         self.commit_offsets(force=True)
         
-        # Отменяем таймер
-        if self.commit_timer:
-            self.commit_timer.cancel()
-        
         # Выводим итоговую статистику
         console.print(f"\n[bold green]📈 [{self.consumer_id}] ИТОГОВАЯ СТАТИСТИКА:[/bold green]")
         self.show_stats()
@@ -858,12 +966,23 @@ EOF
 
 echo "Запускаем консюмер с ручным коммитом (в одном терминале)..."
 python3 manual_commit_consumer.py --id consumer-1 --messages 50
+# ОЖИДАЕМЫЙ ВЫВОД: обработка 50 сообщений, периодические "Закоммичены offsets", в конце
+#   статистика (обработано / закоммичено / неудачных).
+# НА ЧТО СМОТРЕТЬ: ~5% сообщений — «отравленные» (падают на всех 3 попытках): для них
+#   видны ретраи (Попытка 1/3 → 2/3) и затем "Отправлено в DLQ". После завершения
+#   появится файл dlq_consumer-1.json — откройте и посмотрите, что в него попало.
 
 # ============================================
 # 3. МНОГОПРОЦЕССНЫЙ КОНСЮМЕР (CONSUMER GROUP)
 # ============================================
 
 echo "Создаем скрипт для запуска нескольких консюмеров в группе..."
+# ЧТО ДЕЛАЕМ: запускаем 3 консюмера В ОДНОЙ группе и наблюдаем, как делятся партиции.
+# ЗАЧЕМ: это горизонтальное масштабирование Kafka — одна группа = один «сервис», партиции
+#   топика делятся между его экземплярами. Больше консюмеров → быстрее обработка.
+# ПОЧЕМУ ТАК: 3 консюмера на 6 партиций → по 2 партиции каждому. Каждая партиция достаётся
+#   РОВНО одному консюмеру (иначе были бы дубли); при уходе консюмера его партиции
+#   перераспределяются автоматически — это и есть ребалансировка.
 
 cat > consumer_group_demo.py << 'EOF'
 #!/usr/bin/env python3
@@ -969,7 +1088,7 @@ def run_consumer(consumer_id, num_messages=100):
 def monitor_consumers(processes):
     """Мониторинг работающих консюмеров"""
     console.print("\n[bold cyan]👁️  Мониторинг консюмеров... (Ctrl+C для остановки)[/bold cyan]")
-    console.print("[yellow]ℹ️  Откройте новый терминал и запустите: python3 rebalance_test.py для тестирования ребалансировки[/yellow]")
+    console.print("[yellow]ℹ️  Скрипт для экспериментов с ребалансировкой (python3 rebalance_test.py) будет создан в разделе 5 — пока просто наблюдайте за распределением партиций[/yellow]")
     
     try:
         start_time = time.time()
@@ -1093,8 +1212,8 @@ def simple_consumer_group_demo():
     console.print("1. Запускаем 3 консюмера в одной группе")
     console.print("2. Каждому назначатся по 2 партиции (всего 6 партиций в топике 'user-actions')")
     console.print("3. Наблюдаем распределение партиций")
-    console.print("4. Для тестирования ребалансировки откройте новый терминал")
-    console.print("5. Запустите: python3 rebalance_test.py")
+    console.print("4. За ребалансировкой наблюдаем в колонке CONSUMER-ID/HOST вывода ниже")
+    console.print("5. (Готовый скрипт экспериментов python3 rebalance_test.py появится в разделе 5)")
     
     # Запускаем 3 консюмера
     processes = {}
@@ -1155,20 +1274,32 @@ if __name__ == "__main__":
     
     console.print("\n[bold green]🎉 Демонстрация завершена![/bold green]")
     console.print("\n[yellow]📚 Дополнительные возможности:[/yellow]")
-    console.print("  - Для тестирования ребалансировки запустите: python3 rebalance_test.py")
-    console.print("  - Для проверки обработки ошибок запустите: python3 error_handling_consumer.py")
+    console.print("  - Скрипт экспериментов python3 rebalance_test.py появится в разделе 5")
+    console.print("  - Скрипт python3 error_handling_consumer.py (обработка ошибок) появится в разделе 4")
     console.print("  - Для просмотра статистики проверьте файлы: dlq_*.json и consumer_stats.json")
 EOF
 
 echo "Запускаем демонстрацию consumer group..."
 echo "Выберите вариант 3 для запуска 3 консюмеров"
 python3 consumer_group_demo.py
+# ОЖИДАЕМЫЙ ВЫВОД: статус 3 консюмеров + вывод kafka-consumer-groups --describe.
+# НА ЧТО СМОТРЕТЬ: в колонке CONSUMER-ID видно, какая партиция кому назначена. Остановите
+#   один консюмер (Ctrl+C) — увидите, как его партиции переехали к оставшимся (rebalance).
+#   LAG — сколько сообщений ещё не обработано (главная метрика консюмера).
 
 # ============================================
 # 4. КОНСЮМЕР С ПРОДВИНУТОЙ ОБРАБОТКОЙ ОШИБОК
 # ============================================
 
 echo "Создаем консюмер с продвинутой обработкой ошибок..."
+# ЧТО ДЕЛАЕМ: консюмер с production-паттернами — валидация, retry с backoff, DLQ-топик,
+#   дедупликация и Circuit Breaker. Работает на ОТДЕЛЬНОМ топике user-actions-error.
+# ЗАЧЕМ: показать, как «не потерять и не зациклиться» на битых данных — плохие сообщения
+#   изолируются в DLQ, а не роняют весь конвейер.
+# ПОЧЕМУ ТАК: отдельный топик нужен, чтобы «битые» не затерялись среди 5000 валидных из
+#   setup_demo (иначе группа читала бы историю с offset 0 и до битых не дошла). Offset
+#   коммитится ТОЛЬКО после терминального исхода (SUCCESS/DLQ/SKIP) — групповая позиция
+#   не «убегает» вперёд неразрешённого сообщения.
 
 cat > error_handling_consumer.py << 'EOF'
 #!/usr/bin/env python3
@@ -1198,13 +1329,33 @@ cat > error_handling_consumer.py << 'EOF'
 4. Validation: проверка сообщений перед обработкой
 5. Deduplication: предотвращение повторной обработки
 
-Запуск:
+Запуск (демонстрация выполняется на ОТДЕЛЬНОМ топике user-actions-error):
 python3 error_handling_consumer.py --produce --messages 30
 
+Зачем отдельный топик:
+- Демо само создаёт (идемпотентно) топик user-actions-error и DLQ-топик
+  user-actions-error-dlq. Оно НЕ читает общий user-actions с 5000
+  исторических сообщений из setup_demo.py: в противном случае «битые»
+  сообщения дописывались бы в хвост и в первом прогоне не достигались бы
+  (группа читала бы старые валидные события, начиная с offset 0).
+- --produce генерирует РОВНО args.messages тестовых сообщений («битые» и
+  «здоровые» перемешаны) ДО подписки консюмера; --messages задаёт, сколько
+  сообщений обработать. По умолчанию оба числа — 30, поэтому «Сгенерировано
+  30» и «обработано 30» сходятся.
+
 Результат:
-Будут созданы тестовые сообщения (включая "плохие"),
-обработаны с применением всех стратегий обработки ошибок,
-создан DLQ топик и сохранена статистика в файл.
+Будут созданы тестовые сообщения (включая "плохие"), обработаны с
+применением всех стратегий обработки ошибок, создан DLQ топик и сохранена
+статистика в файл consumer_stats.json.
+
+Про гарантии и retry:
+- Сообщение обрабатывается в ГЛАВНОМ цикле: poll -> обработка (ограниченные
+  inline-retry с экспоненциальной задержкой) -> commit. Offset коммитится
+  только ПОСЛЕ терминального исхода сообщения (SUCCESS / DLQ / SKIP),
+  поэтому групповая позиция не может «убежать» вперёд ещё не разрешённого
+  сообщения, и после рестарта оно не теряется.
+- Фоновой retry-очереди и фоновых потоков нет: confluent-kafka Consumer
+  не потокобезопасен, коммит/статистика живут в одном потоке.
 """
 
 from confluent_kafka import Consumer, KafkaError, Producer
@@ -1212,7 +1363,6 @@ import json
 import time
 import signal
 import sys
-import threading
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
@@ -1236,6 +1386,35 @@ def check_topic_exists(topic="user-actions"):
             return False
         return True
     except Exception:
+        return False
+
+def ensure_error_demo_topic(topic="user-actions-error"):
+    """Идемпотентное создание отдельного топика демонстрации (раздел 4)
+    
+    Демо читает и пишет в СВОЙ свежий топик, а не в user-actions с 5000
+    исторических сообщений из setup_demo.py — иначе «битые» сообщения
+    оказались бы в хвосте и не были бы достигнуты в первом прогоне.
+    Повторный запуск безопасен: "already exists" не считается ошибкой.
+    """
+    try:
+        result = subprocess.run(
+            ['/opt/kafka/bin/kafka-topics.sh', '--create',
+             '--topic', topic,
+             '--bootstrap-server', 'localhost:9092',
+             '--partitions', '3',
+             '--replication-factor', '3'],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0 or "already exists" in result.stderr:
+            console.print(f"[green]✅ Топик {topic} готов[/green]")
+            return True
+        else:
+            console.print(f"[yellow]⚠️  Не удалось создать топик {topic}: {result.stderr.strip()}[/yellow]")
+            return False
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Ошибка создания топика: {e}[/yellow]")
         return False
 
 class ProcessingResult(Enum):
@@ -1308,7 +1487,7 @@ class TestMessageProducer:
                 console.print(f"[cyan]📨 Отправлено {self.message_count} сообщений...[/cyan]")
 
 class ErrorHandlingConsumer:
-    def __init__(self, bootstrap_servers, group_id, topic, produce_test_messages=False):
+    def __init__(self, bootstrap_servers, group_id, topic, produce_test_messages=0):
         """
         Консюмер с продвинутой обработкой ошибок
         
@@ -1316,7 +1495,8 @@ class ErrorHandlingConsumer:
             bootstrap_servers: адреса брокеров
             group_id: ID группы
             topic: топик для подписки
-            produce_test_messages: создать тестовые сообщения при старте
+            produce_test_messages: сколько тестовых сообщений сгенерировать
+                в consume() перед подпиской (0 — не генерировать)
         """
         self.config = {
             'bootstrap.servers': bootstrap_servers,
@@ -1351,11 +1531,13 @@ class ErrorHandlingConsumer:
             'start_time': time.time(),
         }
         
-        # Очередь для повторной обработки
-        self.retry_queue = []
-        self.retry_lock = threading.Lock()
+        # Сколько тестовых сообщений сгенерировать (0 — не генерировать).
+        # Сама генерация выполняется в consume() ПОСЛЕ создания топика и ДО
+        # подписки: консюмер (auto.offset.reset=earliest) прочитает именно
+        # свежую порцию, а не историю общего топика.
+        self.produce_test_messages = produce_test_messages
         
-        # Circuit Breaker состояние
+        # Circuit Breaker состояние (мутируется только в главном потоке)
         self.circuit_state = {
             'open': False,
             'failure_count': 0,
@@ -1370,17 +1552,10 @@ class ErrorHandlingConsumer:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        # Запускаем фоновые потоки
-        self.retry_thread = threading.Thread(target=self.process_retry_queue, daemon=True)
-        self.retry_thread.start()
-        
-        self.monitor_thread = threading.Thread(target=self.monitor_health, daemon=True)
-        self.monitor_thread.start()
-        
-        # Создаем тестовые сообщения если нужно
-        if produce_test_messages:
-            producer = TestMessageProducer(topic, bootstrap_servers)
-            producer.produce_messages(50)
+        # NB: фоновых потоков (retry-очередь, мониторинг) здесь НЕТ.
+        # confluent-kafka Consumer не потокобезопасен, поэтому вся работа
+        # (poll -> inline-retry -> commit) выполняется в одном главном
+        # потоке consume() — см. методы process_message_with_retry()/consume().
     
     def signal_handler(self, signum, frame):
         """Обработчик сигналов"""
@@ -1399,12 +1574,15 @@ class ErrorHandlingConsumer:
             if time.time() - self.circuit_state['last_failure'] > 30:  # 30 секунд
                 self.circuit_state['open'] = False
                 self.circuit_state['half_open_time'] = time.time()
+                # Сбрасываем счётчик ошибок, чтобы после half-open не открыться
+                # сразу снова (иначе «прощупывание» было бы бесполезным).
+                self.circuit_state['failure_count'] = 0
                 console.print("[yellow]🔄 Circuit Breaker переходит в half-open состояние[/yellow]")
                 return True
             return False
         
         # Если слишком много ошибок, открываем Circuit Breaker
-        if self.circuit_state['failure_count'] >= 10:
+        if self.circuit_state['failure_count'] >= 5:
             self.circuit_state['open'] = True
             self.circuit_state['last_failure'] = time.time()
             console.print("[red]🔴 Circuit Breaker открыт! Пауза 30 секунд[/red]")
@@ -1463,9 +1641,12 @@ class ErrorHandlingConsumer:
         elif data['action'] == 'login':
             time.sleep(0.05)  # 50ms
         
-        # 3. 10% сообщений генерируют ошибку для демонстрации
+        # 3. ~10% сообщений генерируют ВРЕМЕННУЮ ошибку (retry-кейс): слово
+        #    "temporary"/"timeout" в тексте направляет её в retry-ветку, а hash(event_id)
+        #    стабилен в рамках процесса — сообщение падает на каждой из 3 попыток и после
+        #    их исчерпания уходит в DLQ. Так наглядно видны backoff (1с, 2с) и итоговый DLQ.
         elif hash(data.get('event_id', '')) % 100 < 10:
-            raise Exception("Random processing error (10% chance)")
+            raise Exception("Temporary processing failure (timeout)")
         
         # 4. Обычные действия
         else:
@@ -1627,74 +1808,56 @@ class ErrorHandlingConsumer:
             console.print(f"[red]❌ Ошибка отправки в DLQ: {e}[/red]")
             return False
     
-    def add_to_retry_queue(self, msg, processed_msg):
-        """Добавление сообщения в очередь повторной обработки"""
-        with self.retry_lock:
-            self.retry_queue.append({
-                'msg': msg,
-                'processed_msg': processed_msg,
-                'added_at': time.time(),
-                'attempt': processed_msg.retry_count,
-            })
-            console.print(f"[yellow]🔄 Добавлено в retry очередь (попытка {processed_msg.retry_count + 1})[/yellow]")
-    
-    def process_retry_queue(self):
-        """Фоновый поток для обработки retry очереди"""
-        console.print("[cyan]🔄 Запущен поток обработки retry очереди[/cyan]")
+    def process_message_with_retry(self, msg, max_attempts=3):
+        """
+        Обработка одного сообщения с ОГРАНИЧЕННЫМИ СИНХРОННЫМИ retry
+        (inline) в главном цикле консюмера.
         
-        while self.running:
-            time.sleep(2)  # Проверяем каждые 2 секунды
+        ВАЖНО про offset'ы: сообщение НЕ покидает главный поток — следующий
+        poll() начнётся только после терминального исхода текущего сообщения,
+        а offset коммитится в consume() ПОСЛЕ возврата из этого метода. Поэтому
+        групповая позиция не может «убежать» вперёд неразрешённого offset N
+        (как было с фоновой retry-очередью: основной цикл коммитил N+1, N+2,
+        ..., и N терялся при рестарте навсегда).
+        
+        Args:
+            msg: сообщение Kafka
+            max_attempts: максимум попыток (включая первую)
+        
+        Returns:
+            ProcessedMessage: ВСЕГДА терминальный исход (SUCCESS/DLQ/SKIP).
+            RETRY после исчерпания попыток превращается в DLQ.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            processed_msg = self.process_message(msg)
             
-            with self.retry_lock:
-                current_time = time.time()
-                to_process = []
-                remaining = []
-                
-                for item in self.retry_queue:
-                    # Экспоненциальная задержка: 2^attempt секунд
-                    delay = 2 ** item['attempt']
-                    
-                    if current_time - item['added_at'] >= delay:
-                        to_process.append(item)
-                    else:
-                        remaining.append(item)
-                
-                self.retry_queue = remaining
+            if processed_msg.result != ProcessingResult.RETRY:
+                # Терминальный исход: SUCCESS / DLQ / SKIP / FATAL
+                return processed_msg
             
-            # Обрабатываем сообщения из retry очереди
-            for item in to_process:
-                console.print(f"[yellow]🔄 Повторная обработка (попытка {item['attempt'] + 1})[/yellow]")
-                
-                # Обрабатываем снова
-                processed_msg = self.process_message(item['msg'])
-                
-                if processed_msg.result == ProcessingResult.RETRY:
-                    # Если снова нужно retry, увеличиваем счетчик
-                    item['attempt'] += 1
-                    item['added_at'] = time.time()
-                    
-                    if item['attempt'] < 3:  # Максимум 3 попытки
-                        with self.retry_lock:
-                            self.retry_queue.append(item)
-                    else:
-                        console.print(f"[red]❌ Превышено максимальное количество retry, отправляем в DLQ[/red]")
-                        self.send_to_dlq(item['msg'], f"Max retries exceeded: {processed_msg.error}")
-                elif processed_msg.result == ProcessingResult.DLQ:
-                    self.send_to_dlq(item['msg'], processed_msg.error)
-    
-    def monitor_health(self):
-        """Фоновый мониторинг здоровья консюмера"""
-        while self.running:
-            time.sleep(5)
+            if attempt >= max_attempts:
+                # Попытки исчерпаны — сообщение уходит в DLQ (его offset будет
+                # закоммичен в consume() после отправки в DLQ)
+                error_msg = f"Max retries exceeded ({max_attempts}): {processed_msg.error}"
+                console.print(f"[red]❌ {error_msg} — отправляю в DLQ[/red]")
+                self.record_failure("max_retries")
+                return ProcessedMessage(
+                    partition=msg.partition(),
+                    offset=msg.offset(),
+                    result=ProcessingResult.DLQ,
+                    processing_time=processed_msg.processing_time,
+                    error=error_msg,
+                    retry_count=attempt,
+                )
             
-            # Проверяем Circuit Breaker
-            if not self.check_circuit_breaker():
-                console.print("[red]🔴 Circuit Breaker открыт, пауза 1 секунда[/red]")
-                time.sleep(1)
-            
-            # Выводим статистику каждые 30 секунд
-            if int(time.time()) % 30 == 0:
-                self.show_stats()
+            # Синхронная пауза перед следующей попыткой (экспоненциальный
+            # backoff: 1с, 2с, ...). Offset в это время НЕ коммитится.
+            delay = 2 ** (attempt - 1)
+            console.print(f"[yellow]🔄 Повторная попытка {attempt}/{max_attempts} для offset {msg.offset()} через {delay} с...[/yellow]")
+            self.stats['retries'] += 1
+            time.sleep(delay)
     
     def update_stats(self, processed_msg):
         """Обновление статистики"""
@@ -1745,18 +1908,15 @@ class ErrorHandlingConsumer:
             table.add_row("Ошибки по типам", ", ".join([f"{k}:{v}" for k, v in self.stats['errors_by_type'].items()]))
         
         console.print(table)
-        
-        # Retry очередь
-        with self.retry_lock:
-            if self.retry_queue:
-                console.print(f"[yellow]📋 В retry очереди: {len(self.retry_queue)} сообщений[/yellow]")
     
     def consume(self, max_messages=None):
         """
-        Основной цикл потребления
+        Основной цикл потребления.
         
-        Args:
-            max_messages: максимальное количество сообщений
+        Всё выполняется в ОДНОМ потоке: poll -> обработка (с ограниченными
+        inline-retry) -> commit. Offset коммитится только ПОСЛЕ терминального
+        исхода сообщения — групповая позиция не «убегает» вперёд ещё не
+        разрешённого сообщения (см. process_message_with_retry).
         """
         console.print(Panel.fit(
             "[bold green]🚀 ЗАПУСК КОНСЮМЕРА С ПРОДВИНУТОЙ ОБРАБОТКОЙ ОШИБОК[/bold green]\n"
@@ -1766,12 +1926,27 @@ class ErrorHandlingConsumer:
             border_style="green"
         ))
         
-        # Создаем DLQ топик если нужно
+        # Создаём DLQ топик (идемпотентно)
         self.create_dlq_topic()
+        
+        # Если запрошена генерация тестовых сообщений — создаём их ДО
+        # подписки. Основной топик уже создан в __main__
+        # (ensure_error_demo_topic), поэтому продюсер пишет в существующий
+        # топик, а консюмер с auto.offset.reset=earliest гарантированно
+        # прочитает именно эту порцию, а не историю общего топика user-actions.
+        if self.produce_test_messages:
+            producer = TestMessageProducer(self.topic, self.config['bootstrap.servers'])
+            producer.produce_messages(self.produce_test_messages)
         
         self.consumer.subscribe([self.topic])
         
         message_count = 0
+        
+        # Таймаут без данных: выход, если 60 секунд не пришло ни одного
+        # сообщения (топик пуст или offset'ы группы уже закоммичены с
+        # прошлого запуска). Иначе цикл крутился бы вечно.
+        NO_DATA_TIMEOUT = 60
+        no_data_since = time.time()
         
         try:
             while self.running and (max_messages is None or message_count < max_messages):
@@ -1784,7 +1959,18 @@ class ErrorHandlingConsumer:
                 msg = self.consumer.poll(timeout=2.0)
                 
                 if msg is None:
+                    if time.time() - no_data_since > NO_DATA_TIMEOUT:
+                        console.print(f"\n[yellow]⚠️  Нет сообщений дольше {NO_DATA_TIMEOUT} секунд — прекращаю работу[/yellow]")
+                        console.print("[yellow]📌 Проверьте, что продюсер работает, или сбросьте offset'ы группы:[/yellow]")
+                        console.print("[yellow]   /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \\[/yellow]")
+                        console.print(f"[yellow]     --group {self.config['group.id']} --reset-offsets --to-earliest --execute --topic {self.topic}[/yellow]")
+                        console.print("[yellow]   либо сгенерируйте новую порцию данных:[/yellow]")
+                        console.print("[yellow]   python3 error_handling_consumer.py --produce --messages 30[/yellow]")
+                        break
                     continue
+                
+                # Сообщение (или событие ошибки) получено — сбрасываем таймер
+                no_data_since = time.time()
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -1794,29 +1980,28 @@ class ErrorHandlingConsumer:
                         self.record_failure("kafka")
                         continue
                 
-                # Обрабатываем сообщение
-                processed_msg = self.process_message(msg)
+                # Обрабатываем сообщение: метод возвращает ТОЛЬКО терминальный
+                # исход (RETRY разрешается синхронно ограниченными inline-
+                # повторами внутри process_message_with_retry)
+                processed_msg = self.process_message_with_retry(msg)
                 self.update_stats(processed_msg)
                 
-                # Обрабатываем результат
-                if processed_msg.result == ProcessingResult.SUCCESS:
-                    # Коммитим offset
-                    self.consumer.commit(message=msg, asynchronous=False)
-                    message_count += 1
-                    
-                elif processed_msg.result == ProcessingResult.RETRY:
-                    self.add_to_retry_queue(msg, processed_msg)
-                    
-                elif processed_msg.result == ProcessingResult.DLQ:
+                # Если исход — DLQ, отправляем сообщение в DLQ-топик
+                if processed_msg.result == ProcessingResult.DLQ:
                     self.send_to_dlq(msg, processed_msg.error)
-                    # Коммитим offset т.к. отправили в DLQ
-                    self.consumer.commit(message=msg, asynchronous=False)
-                    message_count += 1
                 
-                elif processed_msg.result == ProcessingResult.SKIP:
-                    # Коммитим offset т.к. пропустили
+                # Коммитим offset ТОЛЬКО после терминального исхода сообщения.
+                # Если бы мы коммитили следующее сообщение, не разрешив текущее
+                # (RETRY), групповая позиция ушла бы за offset текущего, и после
+                # рестарта сообщение потерялось бы навсегда.
+                if processed_msg.result in (ProcessingResult.SUCCESS,
+                                            ProcessingResult.DLQ,
+                                            ProcessingResult.SKIP):
                     self.consumer.commit(message=msg, asynchronous=False)
                     message_count += 1
+                else:
+                    # RETRY/FATAL не должны выходить из process_message_with_retry
+                    console.print(f"[red]❌ Неожиданный исход обработки: {processed_msg.result}[/red]")
                 
                 # Показываем статистику каждые 10 сообщений
                 if message_count % 10 == 0 and message_count > 0:
@@ -1855,11 +2040,6 @@ class ErrorHandlingConsumer:
         """Корректное закрытие консюмера"""
         console.print("\n[yellow]🔒 Завершение работы консюмера...[/yellow]")
         
-        # Обрабатываем оставшиеся сообщения в retry очереди
-        if self.retry_queue:
-            console.print(f"[yellow]⏳ Обработка {len(self.retry_queue)} сообщений в retry очереди...[/yellow]")
-            time.sleep(3)
-        
         # Выводим итоговую статистику
         console.print("\n" + "="*60)
         console.print("[bold green]📈 ИТОГОВАЯ СТАТИСТИКА ОБРАБОТКИ ОШИБОК[/bold green]")
@@ -1878,30 +2058,33 @@ class ErrorHandlingConsumer:
         console.print(f"[cyan]📁 Статистика сохранена в consumer_stats.json[/cyan]")
 
 if __name__ == "__main__":
-    # Конфигурация
+    # Конфигурация: демо работает на ОТДЕЛЬНОМ топике user-actions-error,
+    # а не на общем user-actions (5000 исторических сообщений из setup_demo
+    # заслонили бы «битые» сообщения демо — см. докстринг скрипта)
     BOOTSTRAP_SERVERS = "localhost:9092"
     GROUP_ID = "error-handling-group"
-    TOPIC = "user-actions"
+    TOPIC = "user-actions-error"
     
     # Парсим аргументы командной строки
     parser = argparse.ArgumentParser(description='Консюмер с обработкой ошибок')
-    parser.add_argument('--messages', type=int, default=30, help='Количество сообщений для обработки')
-    parser.add_argument('--produce', action='store_true', help='Создать тестовые сообщения перед запуском')
+    parser.add_argument('--messages', type=int, default=30, help='Сколько сообщений обработать и (с --produce) сгенерировать')
+    parser.add_argument('--produce', action='store_true', help='Сгенерировать тестовые сообщения перед запуском')
     args = parser.parse_args()
     
-    # Проверяем существование топика
-    if not check_topic_exists(TOPIC):
-        console.print("[red]❌ Топик 'user-actions' не найден![/red]")
-        console.print("[yellow]📌 Запустите сначала подготовку окружения:[/yellow]")
-        console.print("[yellow]   python3 setup_demo.py[/yellow]")
+    # Создаём (идемпотентно) отдельный топик демонстрации: он не зависит от
+    # setup_demo.py и создаётся скриптом самостоятельно
+    if not ensure_error_demo_topic(TOPIC):
+        console.print("[red]❌ Не удалось подготовить топик демонстрации[/red]")
         sys.exit(1)
     
-    # Создаем и запускаем консюмер
+    # Создаем и запускаем консюмер.
+    # Число сгенерированных сообщений = args.messages (при --produce), чтобы
+    # «Сгенерировано N» и «обработано N» сходились.
     consumer = ErrorHandlingConsumer(
         BOOTSTRAP_SERVERS, 
         GROUP_ID, 
         TOPIC,
-        produce_test_messages=args.produce
+        produce_test_messages=args.messages if args.produce else 0
     )
     
     # Обрабатываем указанное количество сообщений
@@ -1909,16 +2092,31 @@ if __name__ == "__main__":
     consumer.consume(max_messages=args.messages)
 EOF
 
-echo "Запускаем консюмер с продвинутой обработкой ошибок..."
-echo "Этот консюмер создаст тестовые сообщения и начнет их обработку."
-echo "Он обработает 30 сообщений и завершится автоматически."
+echo "Запускаем демо обработки ошибок на ОТДЕЛЬНОМ топике user-actions-error..."
+echo "Консюмер сам создаст топик user-actions-error и DLQ user-actions-error-dlq,"
+echo "сгенерирует 30 тестовых сообщений (включая «битые») ДО подписки и обработает"
+echo "именно их: в свежем топике нет исторических данных, поэтому validation/DLQ/"
+echo "retry-пути достижимы уже в первом прогоне (демо НЕ читает 5000 сообщений user-actions)."
 python3 error_handling_consumer.py --produce --messages 30
+# ОЖИДАЕМЫЙ ВЫВОД: "Сгенерировано 30 сообщений", затем обработка с разными исходами:
+#   успехи, ошибки валидации → DLQ, временные ошибки → retry (1с, 2с) → DLQ. В конце
+#   статистика + файл consumer_stats.json.
+# НА ЧТО СМОТРЕТЬ: в таблице статистики Retry > 0 (временные ошибки реально повторяются)
+#   и DLQ > 0 (битые ушли в топик user-actions-error-dlq). Проверить DLQ:
+#   /opt/kafka/bin/kafka-console-consumer.sh --topic user-actions-error-dlq --from-beginning --max-messages 2 --bootstrap-server localhost:9092
+#   Circuit Breaker может открыться («🔴 Пауза 30 с»), если ошибки накопятся до порога — это норма.
 
 # ============================================
 # 5. ТЕСТИРОВАНИЕ РЕБАЛАНСИРОВКИ
 # ============================================
 
 echo "Создаем скрипт для тестирования ребалансировки..."
+# ЧТО ДЕЛАЕМ: интерактивное меню с 5 сценариями ребалансировки (добавление/удаление/сбой
+#   консюмера, увеличение партиций, смена подписки).
+# ЗАЧЕМ: дать УПРАВЛЯЕМЫЙ способ изучить ребалансировку — в отличие от consumer_group_demo,
+#   здесь можно пошагово запускать/убивать консюмеров и сразу видеть эффект.
+# ПОЧЕМУ ТАК: сценарии 4–5 создают свои топики (test-rebalance, topic-a/b) и удаляют их в
+#   конце, чтобы повторные запуски не оставляли мусор в кластере.
 
 cat > rebalance_test.py << 'EOF'
 #!/usr/bin/env python3
@@ -1959,6 +2157,7 @@ import threading
 import time
 import signal
 import sys
+import os
 from rich.console import Console
 from rich.table import Table
 from rich.layout import Layout
@@ -1991,6 +2190,9 @@ class RebalanceTester:
             "Увеличение партиций",
             "Изменение subscription"
         ]
+        # Топики, созданные сценариями 4-5: удаляются в конце run_scenario,
+        # чтобы повторные запуски лабы не оставляли мусор в кластере
+        self.scenario_topics_to_clean = []
     
     def start_consumer(self, consumer_id):
         """Запуск консюмера"""
@@ -2028,13 +2230,20 @@ class RebalanceTester:
             del self.processes[consumer_id]
     
     def check_consumer_group(self):
-        """Проверка состояния consumer group"""
+        """Проверка состояния consumer group через CLI
+        
+        Используем обычный --describe: колонки CONSUMER-ID/HOST наглядно
+        показывают, как партиции перераспределяются между консюмерами.
+        НЕ используем '--describe --state' без значения: в Kafka 4.x опция
+        --state — это ФИЛЬТР, требующий значения (Stable, Empty и т.п.),
+        а не переключатель — без значения команда завершится ошибкой.
+        """
         try:
             result = subprocess.run(
                 ['/opt/kafka/bin/kafka-consumer-groups.sh',
                  '--bootstrap-server', 'localhost:9092',
                  '--group', 'manual-commit-group',
-                 '--describe', '--state'],
+                 '--describe'],
                 capture_output=True,
                 text=True,
                 timeout=5
@@ -2047,6 +2256,39 @@ class RebalanceTester:
                 
         except Exception as e:
             return f"Исключение: {e}"
+    
+    def create_topic_if_missing(self, topic, partitions=3):
+        """Идемпотентное создание топика (повторный запуск безопасен)"""
+        result = subprocess.run(
+            ['/opt/kafka/bin/kafka-topics.sh', '--create',
+             '--topic', topic,
+             '--bootstrap-server', 'localhost:9092',
+             '--partitions', str(partitions),
+             '--replication-factor', '3'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            console.print(f"[green]✅ Топик {topic} создан[/green]")
+        elif "already exists" in result.stderr:
+            console.print(f"[yellow]ℹ️  Топик {topic} уже существует — продолжаем[/yellow]")
+        else:
+            console.print(f"[yellow]⚠️  Ошибка создания топика {topic}: {result.stderr.strip()}[/yellow]")
+    
+    def delete_topic(self, topic):
+        """Удаление топика (отсутствующий топик — не ошибка)"""
+        result = subprocess.run(
+            ['/opt/kafka/bin/kafka-topics.sh', '--delete',
+             '--topic', topic,
+             '--bootstrap-server', 'localhost:9092'],
+            capture_output=True,
+            text=True
+        )
+        combined = (result.stdout + " " + result.stderr).lower()
+        if result.returncode == 0 or "does not exist" in combined:
+            console.print(f"[green]🗑️  Топик {topic} удалён[/green]")
+        else:
+            console.print(f"[yellow]⚠️  Не удалось удалить топик {topic}: {result.stderr.strip()}[/yellow]")
     
     def run_scenario(self, scenario_num):
         """Запуск сценария ребалансировки"""
@@ -2098,14 +2340,12 @@ class RebalanceTester:
             
         elif scenario_num == 4:
             # Сценарий 4: Увеличение партиций
-            console.print("1. Создаем топик с 3 партициями")
-            subprocess.run([
-                '/opt/kafka/bin/kafka-topics.sh', '--create',
-                '--topic', 'test-rebalance',
-                '--bootstrap-server', 'localhost:9092',
-                '--partitions', '3',
-                '--replication-factor', '3'
-            ], capture_output=True)
+            console.print("1. Создаем топик test-rebalance с 3 партициями")
+            # Идемпотентное создание: повторный запуск не падает с
+            # "Topic already exists"
+            self.create_topic_if_missing('test-rebalance', partitions=3)
+            # Топик будет удалён в конце run_scenario (см. блок очистки ниже)
+            self.scenario_topics_to_clean = ['test-rebalance']
             
             console.print("\n2. Запускаем 3 консюмера")
             for i in range(3):
@@ -2166,31 +2406,97 @@ if __name__ == "__main__":
                 os.remove('temp_consumer.py')
             
         elif scenario_num == 5:
-            # Сценарий 5: Изменение subscription
-            console.print("1. Запускаем консюмер на топике A")
-            # Для этого сценария нужны два топика
-            subprocess.run([
-                '/opt/kafka/bin/kafka-topics.sh', '--create',
-                '--topic', 'topic-a',
-                '--bootstrap-server', 'localhost:9092',
-                '--partitions', '3',
-                '--replication-factor', '3'
-            ], capture_output=True)
+            # Сценарий 5: Изменение subscription консюмера.
+            # Нужны два топика; создаём их идемпотентно (повторный запуск
+            # безопасен), в конце run_scenario они будут удалены.
+            console.print("1. Создаем топики topic-a и topic-b (по 3 партиции)")
+            self.create_topic_if_missing('topic-a', partitions=3)
+            self.create_topic_if_missing('topic-b', partitions=3)
+            self.scenario_topics_to_clean = ['topic-a', 'topic-b']
             
-            subprocess.run([
-                '/opt/kafka/bin/kafka-topics.sh', '--create',
-                '--topic', 'topic-b',
-                '--bootstrap-server', 'localhost:9092',
-                '--partitions', '3',
-                '--replication-factor', '3'
-            ], capture_output=True)
+            console.print("\n2. Запускаем консюмер, подписанный на topic-a")
+            # Вспомогательный скрипт: консюмер сначала подписан на topic-a,
+            # а примерно через 12 секунд САМ меняет подписку (повторный вызов
+            # subscribe()) на topic-b. Kafka проводит ребалансировку: партиции
+            # topic-a отзываются, консюмеру назначаются партиции topic-b.
+            with open('temp_subscription_switch.py', 'w') as f:
+                f.write('''
+import sys
+import time
+from confluent_kafka import Consumer, KafkaError
+
+# Вспомогательный консюмер сценария 5: ~12 секунд подписан на topic-a,
+# затем меняет подписку на topic-b (subscribe() можно вызывать повторно —
+# старая подписка заменяется новой).
+if __name__ == "__main__":
+    group_id = sys.argv[1]
+    c = Consumer({
+        'bootstrap.servers': 'localhost:9092',
+        'group.id': group_id,
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': True,
+        'session.timeout.ms': 10000,
+    })
+    try:
+        c.subscribe(['topic-a'])
+        print("Подписан на topic-a")
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            msg = c.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error() and msg.error().code() != KafkaError._PARTITION_EOF:
+                print(f"Ошибка: {msg.error()}")
+
+        # Меняем подписку: topic-a -> topic-b
+        c.subscribe(['topic-b'])
+        print("Подписка изменена на topic-b")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            msg = c.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error() and msg.error().code() != KafkaError._PARTITION_EOF:
+                print(f"Ошибка: {msg.error()}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        c.close()
+''')
+            self.processes['switch-A'] = subprocess.Popen(
+                [sys.executable, 'temp_subscription_switch.py', 'manual-commit-group'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            console.print(f"[green]✅ Запущен консюмер (PID: {self.processes['switch-A'].pid})[/green]")
             
-            console.print("\n2. Демонстрация завершена (сложный сценарий)")
+            # Фаза 1: консюмер ещё на topic-a
+            console.print("\n3. Ждём 8 секунд и проверяем распределение (консюмер на topic-a)")
+            time.sleep(8)
+            console.print("   Ожидаем: партиции topic-a 0-2 назначены консюмеру группы")
+            console.print(self.check_consumer_group())
             
-        # Очистка после сценария
+            # Фаза 2: консюмер сменил подписку на topic-b (~12-я секунда работы)
+            console.print("\n4. Консюмер меняет подписку на topic-b — ждём ребалансировки")
+            console.print("   (переключение происходит примерно на 12-й секунде работы консюмера)")
+            time.sleep(10)
+            console.print("   Ожидаем: партиции topic-a освобождены, назначены партиции topic-b 0-2")
+            console.print(self.check_consumer_group())
+            
+            # Удаляем временный скрипт
+            if os.path.exists('temp_subscription_switch.py'):
+                os.remove('temp_subscription_switch.py')
+            
+        # Очистка после сценария: останавливаем консюмеры...
         console.print("\n[yellow]🧹 Очистка...[/yellow]")
         for consumer_id in list(self.processes.keys()):
             self.stop_consumer(consumer_id)
+        
+        # ...и удаляем топики, созданные сценариями 4-5 (test-rebalance,
+        # topic-a, topic-b), чтобы повторные запуски не оставляли мусор
+        for topic in self.scenario_topics_to_clean:
+            self.delete_topic(topic)
+        self.scenario_topics_to_clean = []
         
         time.sleep(2)
     
@@ -2279,12 +2585,29 @@ EOF
 echo "Запускаем интерактивное тестирование ребалансировки..."
 echo "Рекомендуется запустить в отдельном терминале для экспериментов"
 python3 rebalance_test.py
+# ОЖИДАЕМЫЙ ВЫВОД: меню команд (start/stop/kill/list/check/scenario/quit).
+# НА ЧТО СМОТРЕТЬ: запустите "scenario 3" (сбой через kill -9) и сравните со "scenario 2"
+#   (graceful shutdown): при graceful коммит offset успевает, при kill -9 — нет, и Kafka
+#   обнаруживает сбой по session.timeout (10 с), после чего перераспределяет партиции.
 
 # ============================================
 # 6. ВИЗУАЛЬНАЯ ДЕМОНСТРАЦИЯ РЕБАЛАНСИРОВКИ
 # ============================================
 
+# ТРИ СПОСОБА ПОКАЗАТЬ РЕБАЛАНСИРОВКУ (зачем три скрипта про одно и то же):
+#   - consumer_group_demo.py (раздел 3) — самостоятельный эксперимент «запустил и смотри»;
+#   - rebalance_test.py (раздел 5) — интерактивное меню для глубокого изучения (kill -9 и т.п.);
+#   - simple_visual_consumer.py + visual_demo_2_3.py (этот раздел) — пошаговая демонстрация
+#     для лекции/вебинара, где ведущий комментирует каждый шаг.
+# Для самостоятельного прохождения лабы достаточно consumer_group_demo.py (раздел 3);
+# разделы 5–6 — опциональные: глубже или для показа на лекции.
+
 echo "Создаем простой консюмер для визуализации..."
+# ЧТО ДЕЛАЕМ: минимальный консюмер без лишнего вывода — только «работает/не работает».
+# ЗАЧЕМ: это ВСПОМОГАТЕЛЬНЫЙ скрипт — его не запускают вручную, а вызывает пошаговая
+#   демонстрация visual_demo_2_3.py (ниже). Сам по себе нужен для визуализации на лекции.
+# ПОЧЕМУ ТАК: намеренно минимум логики — в отличие от manual_commit_consumer, здесь нет
+#   retry/DLQ/статистики, только чтение и вывод факта обработки.
 
 cat > simple_visual_consumer.py << 'EOF'
 #!/usr/bin/env python3
@@ -2346,13 +2669,28 @@ class SimpleVisualConsumer:
         self.consumer.subscribe([topic])
         
         msg_count = 0
+        # Таймаут без данных: если 60 секунд не пришло ни одного сообщения
+        # (топик пуст или offset'ы группы уже закоммичены с прошлого запуска),
+        # завершаемся с подсказкой — иначе консюмер ждал бы вечно.
+        NO_DATA_TIMEOUT = 60
+        no_data_since = time.time()
         
         try:
             while self.running:
                 msg = self.consumer.poll(timeout=1.0)
                 
                 if msg is None:
+                    if time.time() - no_data_since > NO_DATA_TIMEOUT:
+                        print(f"[{self.consumer_id}] Нет сообщений дольше {NO_DATA_TIMEOUT} секунд — завершаюсь")
+                        print(f"[{self.consumer_id}] Проверьте, что продюсер работает, или сбросьте offset'ы группы:")
+                        print(f"[{self.consumer_id}] /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \\")
+                        print(f"[{self.consumer_id}]   --group {self.config['group.id']} --reset-offsets --to-earliest --execute --topic {topic}")
+                        self.running = False
+                        break
                     continue
+                
+                # Сообщение (или событие ошибки) получено — сбрасываем таймер
+                no_data_since = time.time()
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -2395,6 +2733,12 @@ if __name__ == "__main__":
 EOF
 
 echo "Создаем скрипт для визуальной демонстрации..."
+# ЧТО ДЕЛАЕМ: пошаговая демонстрация ребалансировки с паузами «нажмите Enter».
+# ЗАЧЕМ: альтернатива consumer_group_demo для ЛЕКЦИИ/ВЕБИНАРА — ведущий запускает
+#   консюмеры по одному и комментирует каждый шаг (1 консюмер → 6 партиций, 2 консюмера →
+#   по 3, остановка → снова 6).
+# ПОЧЕМУ ТАК: внутри запускает simple_visual_consumer.py в отдельных процессах и после
+#   каждого шага печатает kafka-consumer-groups --describe, чтобы видеть перераспределение.
 
 cat > visual_demo_2_3.py << 'EOF'
 #!/usr/bin/env python3
@@ -2516,6 +2860,9 @@ EOF
 
 echo "Для визуальной демонстрации ребалансировки выполните:"
 echo "python3 visual_demo_2_3.py"
+# ОЖИДАЕМЫЙ ВЫВОД: после каждого "Enter" — состояние группы (какие партиции кому назначены).
+# НА ЧТО СМОТРЕТЬ: 1-й консюмер забирает все 6 партиций; после запуска 2-го — по 3; после
+#   остановки 2-го — первый снова забирает все 6. Это и есть ребалансировка «вживую».
 
 # ============================================
 # 7. ПРОВЕРКА РЕЗУЛЬТАТОВ И МОНИТОРИНГ
@@ -2545,10 +2892,12 @@ echo "Проверяем DLQ топик:"
   echo "DLQ топики не найдены"
 
 # 7.4. Читаем несколько сообщений из DLQ (если есть)
-if /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep -q "user-actions-dlq"; then
+# Демо раздела 4 пишет DLQ в топик user-actions-error-dlq (своя пара
+# «основной топик user-actions-error + DLQ»)
+if /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep -q "user-actions-error-dlq"; then
   echo "Читаем 2 сообщения из DLQ:"
   timeout 5 /opt/kafka/bin/kafka-console-consumer.sh \
-    --topic user-actions-dlq \
+    --topic user-actions-error-dlq \
     --bootstrap-server localhost:9092 \
     --from-beginning \
     --max-messages 2 \
@@ -2563,7 +2912,7 @@ echo "=== ЛАБОРАТОРНАЯ 2.3 ЗАВЕРШЕНА ==="
 echo ""
 echo "🎉 ВЫ ПОЗНАКОМИЛИСЬ С:"
 echo "   1. Базовым консюмером с автокоммитом"
-echo "   2. Ручным управлением offset (exactly-once семантика)"
+echo "   2. Ручным управлением offset (at-least-once + DLQ, НЕ exactly-once)"
 echo "   3. Consumer groups и ребалансировкой"
 echo "   4. Продвинутой обработкой ошибок (Circuit Breaker, Retry, DLQ)"
 echo "   5. Тестированием различных сценариев ребалансировки"
@@ -2594,6 +2943,14 @@ echo "   2. Слишком частый commit() → снижение произ
 echo "   3. Игнорирование rebalance callback → потеря сообщений при ребалансировке"
 echo "   4. Отсутствие обработки ошибок → silent failures"
 echo "   5. Неправильный max.poll.interval.ms → false rebalances"
+echo "   6. Повторный запуск консюмера «зависает»: offset'ы группы уже закоммичены,"
+echo "      а новых сообщений нет. Сбросить offset'ы и перечитать всё с начала:"
+echo "      /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \\"
+echo "        --group manual-commit-group --reset-offsets --to-earliest --execute --topic user-actions"
+echo "      (для других групп подставьте basic-consumer-group / error-handling-group и топик"
+echo "      user-actions / user-actions-error соответственно)"
+echo "   7. Демо раздела 4 работает с ОТДЕЛЬНЫМ топиком user-actions-error (30 своих"
+echo "      сообщений) — «битые» сообщения не нужно искать среди 5000 сообщений user-actions"
 echo ""
 echo "🚀 ПРОДВИНУТЫЕ ТЕМЫ ДЛЯ САМОСТОЯТЕЛЬНОГО ИЗУЧЕНИЯ:"
 echo "   1. Exactly-once семантика с транзакционными консюмерами"
@@ -2615,7 +2972,7 @@ echo "   1. python3 setup_demo.py                     # Настройка ок�
 echo "   2. python3 basic_consumer.py                 # Базовый консюмер"
 echo "   3. python3 manual_commit_consumer.py --id consumer-1 --messages 50"
 echo "   4. python3 consumer_group_demo.py            # Consumer group (выберите вариант 3)"
-echo "   5. python3 error_handling_consumer.py        # Обработка ошибок"
+echo "   5. python3 error_handling_consumer.py --produce --messages 30"
 echo "   6. python3 rebalance_test.py                 # Тестирование ребалансировки"
 echo "   7. python3 visual_demo_2_3.py                # Визуальная демонстрация"
 [file content end]
