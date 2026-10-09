@@ -1,0 +1,406 @@
+# ============================================
+# Лабораторная 4: Потоковая обработка на Apache Flink SQL (поверх CDC-пайплайна из лабы 3.2)
+# ============================================
+
+# ЦЕЛИ:
+# 1. Установить Apache Flink и запустить интерактивный SQL Client (embedded-режим)
+# 2. Прочитать CDC-топик postgres-server.public.orders (Debezium, из лабы 3.2) в Flink
+# 3. Очистить и обогатить поток заказов (итоговая сумма, категория)
+# 4. Посчитать оконные агрегаты (выручка по категориям за 30 секунд)
+# 5. Записать результат в Kafka и доставить в OpenSearch (через Connect из лабы 3.2)
+
+# ВРЕМЯ ВЫПОЛНЕНИЯ: 60–90 минут
+
+# ПОЧЕМУ FLINK, А НЕ KSQLDB:
+# ksqlDB заморожен (последний релиз 0.29.0 в 2023 г., работает только с Kafka 3.x,
+# а у курса Kafka 4.1.1), и его standalone-дистрибутив больше не раздаётся.
+# Apache Flink — активно развивающийся стандарт потоковой обработки на SQL:
+# штатно совместим с Kafka 4.x и решает ту же задачу «SQL поверх потоков».
+
+# ПРЕ-РЕКВИЗИТ (должна быть выполнена лабораторная 3.2):
+#   - работает Kafka Connect (systemd-сервис kafka-connect, REST http://localhost:8083);
+#   - в Kafka есть топик postgres-server.public.orders с данными CDC;
+#   - в /opt/kafka/connect-plugins лежит Aiven OpenSearch-коннектор (используем ниже).
+# Проверка пре-реквизита:
+#   curl -s http://localhost:8083/connectors | jq .
+#   /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep postgres-server
+
+# ============================================
+# 0. ЧТО МЫ БУДЕМ СТРОИТЬ (архитектура)
+# ============================================
+# PostgreSQL → Debezium (лаб. 3.2) → Kafka → Flink SQL → Kafka (revenue_30s) → Connect → OpenSearch
+#   БД          CDC-коннектор          брокер   оконные агрегаты   топик-результат     sink    индекс
+#
+# Ключевая идея: Flink НЕ трогает PostgreSQL/OpenSearch напрямую. Он читает уже готовый
+# CDC-поток из Kafka, считает агрегаты и кладёт результат обратно в Kafka (топик
+# revenue_30s). Дальше тот же Aiven-коннектор, что мы настроили в лабе 3.2, доставляет
+# результат в OpenSearch. Kafka остаётся «единой шиной» курса.
+
+# ============================================
+# 1. УСТАНОВКА FLINK
+# ============================================
+
+# Выполняем на kafka1.lab (10.0.2.20). Java 21 уже установлена (лаб. 1).
+
+# 1.1. Скачиваем Apache Flink (актуальная ветка 2.x, совместима с Kafka 4.1.1)
+#      Размер ~540 МБ — скачивается один раз.
+cd /opt
+sudo wget https://archive.apache.org/dist/flink/flink-2.2.1/flink-2.2.1-bin-scala_2.12.tgz
+sudo tar -xzf flink-2.2.1-bin-scala_2.12.tgz
+sudo mv flink-2.2.1 flink
+sudo chown -R kafka:kafka /opt/flink
+
+# 1.2. Кладём SQL-коннектор Kafka (fat-jar: и коннектор 'kafka', и формат 'json')
+#      Версия 5.0.0-2.2 = коннектор 5.0.0 для Flink 2.2 (внутри kafka-clients 4.x).
+sudo -u kafka wget -P /opt/flink/lib/ \
+  https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/5.0.0-2.2/flink-sql-connector-kafka-5.0.0-2.2.jar
+
+# Проверка: jar на месте, версия Java подходит
+ls -la /opt/flink/lib/ | grep flink-sql-connector-kafka
+java -version   # ожидаем 21.x
+
+# ПРИМЕЧАНИЕ про «сервер»: отдельный кластер (jobmanager/taskmanager) НЕ нужен.
+# SQL Client в embedded-режиме поднимает мини-кластер прямо в своём процессе.
+
+# ============================================
+# 2. ЗАПУСК SQL CLIENT (embedded)
+# ============================================
+
+# Запускаем интерактивный SQL Client от пользователя kafka.
+# embedded-режим — это режим ПО УМОЛЧАНИЮ: кластер стартует внутри процесса клиента.
+sudo -u kafka /opt/flink/bin/sql-client.sh
+
+# Вы увидите приглашение:
+#   Flink SQL>
+# Здесь мы будем выполнять SQL-команды по одной (копируйте блоки из разделов 3–5).
+
+# ПОЛЕЗНЫЕ КОМАНДЫ ВНУТРИ SQL CLIENT:
+#   SHOW TABLES;          — список созданных таблиц/представлений
+#   DESCRIBE orders_raw;  — схема таблицы
+#   RESET;                — сбросить настройки сессии
+#   QUIT; / EXIT;         — выйти (Ctrl+C в запущенном непрерывном запросе)
+
+# ============================================
+# 3. ЧТЕНИЕ CDC-ТОПИКА И ОБОГАЩЕНИЕ (DDL)
+# ============================================
+
+# 3.1. Источник: сырой Debezium-envelope из лабы 3.2
+# -----------------------------------------------------------------
+# ЧТО ДЕЛАЕМ: объявляем таблицу orders_raw поверх топика postgres-server.public.orders.
+# ЗАЧЕМ: Flink будет читать изменения заказов в реальном времени.
+# ПОЧЕМУ ТАК: Debezium из лабы 3.2 пишет JSON БЕЗ схемы (JsonConverter,
+#   schemas.enable=false). Сообщение имеет обёртку:
+#   {"before": {...}|null, "after": {...}|null, "source": {...}, "op": "c"/"u"/"d", "ts_ms": ...}
+#   Мы читаем его как append-only поток (формат 'json') и сами разбираем 'after' —
+#   это самый наглядный и не требующий правок в лабе 3.2 способ (альтернатива
+#   'debezium-json' требует REPLICA IDENTITY FULL у таблицы orders).
+#   price объявлен DOUBLE, потому что в лабе 3.2 задан decimal.handling.mode=double.
+# -----------------------------------------------------------------
+
+CREATE TABLE orders_raw (
+  `before` ROW<id INT, order_number STRING, customer_name STRING, product STRING, quantity INT, price DOUBLE>,
+  `after`  ROW<id INT, order_number STRING, customer_name STRING, product STRING, quantity INT, price DOUBLE>,
+  op STRING,
+  ts_ms BIGINT
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'postgres-server.public.orders',
+  'properties.bootstrap.servers' = 'kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092',
+  'scan.startup.mode' = 'earliest-offset',
+  'value.format' = 'json'
+);
+
+# ПРОВЕРКА (после CREATE — быстрый взгляд на исторические записи):
+#   SELECT * FROM orders_raw LIMIT 5;
+# ОЖИДАЕМЫЙ ВЫВОД: строки с колонками before/after/op/ts_ms. У INSERT (op='c') before=null,
+#   у DELETE (op='d') after=null. ts_ms — время события в миллисекундах (epoch).
+
+# 3.2. Обогащённый поток заказов (view)
+# -----------------------------------------------------------------
+# ЧТО ДЕЛАЕМ: извлекаем полезную нагрузку AFTER, отбрасываем удаления, считаем
+#   итоговую сумму и категорию, добавляем processing-time атрибут ptime.
+# ЗАЧЕМ: для оконной агрегации нужен «плоский» поток заказов без CDC-обёртки.
+# ПОЧЕМУ ТАК: WHERE `after` IS NOT NULL отбрасывает DELETE-события (у них after=null).
+#   ptime = PROCTIME() — это processing-time (время обработки), а не время события.
+#   Для учебной демонстрации processing-time надёжнее event-time: окно закрывается
+#   через 30 сек независимо от того, есть ли «более поздние» события в топике.
+# -----------------------------------------------------------------
+
+CREATE TEMPORARY VIEW orders_enriched AS
+SELECT
+  `after`.id            AS id,
+  `after`.order_number  AS order_number,
+  `after`.customer_name AS customer_name,
+  `after`.product       AS product,
+  `after`.quantity      AS quantity,
+  `after`.price         AS price,
+  `after`.quantity * `after`.price AS total_price,
+  CASE
+    WHEN `after`.price > 100000 THEN 'Premium'
+    WHEN `after`.price > 50000  THEN 'Standard'
+    ELSE 'Budget'
+  END AS category,
+  PROCTIME() AS ptime
+FROM orders_raw
+WHERE `after` IS NOT NULL;
+
+# ПРОВЕРКА:
+#   SELECT * FROM orders_enriched LIMIT 10;
+# ОЖИДАЕМЫЙ ВЫВОД: плоские строки заказов + колонки total_price и category.
+#   Заказы с price > 100000 → 'Premium' (напр. «Ноутбук Dell XPS» за 149999.99).
+
+# ============================================
+# 4. ОКОННАЯ АГРЕГАЦИЯ И ЗАПИСЬ В KAFKA
+# ============================================
+
+# 4.0. Создаём топик-результат (RF=3, 3 партиции) — Flink сам топики не создаёт надёжно.
+#      Выполняем в ОТДЕЛЬНОМ терминале (вне SQL Client):
+#   /opt/kafka/bin/kafka-topics.sh --create --if-not-exists \
+#     --topic revenue_30s --partitions 3 --replication-factor 3 \
+#     --bootstrap-server localhost:9092
+
+# 4.1. Приёмник: таблица revenue_30s поверх топика revenue_30s
+# -----------------------------------------------------------------
+# ЧТО ДЕЛАЕМ: объявляем таблицу, в которую Flink будет писать оконные агрегаты.
+# ЗАЧЕМ: результат обработки должен попасть обратно в Kafka, чтобы его мог прочитать
+#   (а) консольный консюмер и (б) Connect-коннектор для OpenSearch.
+# ПОЧЕМУ ТАК: 'format' = 'json' — Flink пишет обычный JSON-объект без схемы, который
+#   поймёт и console-consumer, и JsonConverter в Connect.
+# -----------------------------------------------------------------
+
+CREATE TABLE revenue_30s (
+  window_start   TIMESTAMP_LTZ(3),
+  window_end     TIMESTAMP_LTZ(3),
+  category       STRING,
+  total_revenue  DOUBLE,
+  order_count    BIGINT
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'revenue_30s',
+  'properties.bootstrap.servers' = 'kafka1.lab:9092,kafka2.lab:9092,kafka3.lab:9092',
+  'format' = 'json'
+);
+
+# 4.2. Оконная агрегация: выручка по категориям за 30 секунд (tumbling window)
+# -----------------------------------------------------------------
+# ЧТО ДЕЛАЕМ: запускаем НЕПРЕРЫВНЫЙ запрос INSERT INTO — он стартует фоновый
+#   streaming-job, который считает SUM(total_price) и COUNT(*) по категориям
+#   в непересекающихся окнах по 30 секунд и пишет результат в revenue_30s.
+# ЗАЧЕМ: показать «оконную» аналитику в реальном времени: как меняется выручка
+#   по категориям за каждые 30 секунд.
+# ПОЧЕМУ ТАК: TUMBLE(...) — окно фиксированной длины без перекрытий. DESCRIPTOR(ptime)
+#   указывает на processing-time колонку из orders_enriched. Окно закрывается и
+#   результат уходит в Kafka через 30 секунд после поступления первого события окна.
+# -----------------------------------------------------------------
+
+INSERT INTO revenue_30s
+SELECT
+  window_start,
+  window_end,
+  category,
+  SUM(total_price) AS total_revenue,
+  COUNT(*)         AS order_count
+FROM TABLE(
+  TUMBLE(TABLE orders_enriched, DESCRIPTOR(ptime), INTERVAL '30' SECONDS)
+)
+GROUP BY window_start, window_end, category;
+
+# После выполнения INSERT команда вернётся в приглашение Flink SQL>, а job продолжит
+# работать в фоне (в embedded-кластере). Проверяем, что job запущен:
+#   SHOW JOBS;
+# ОЖИДАЕМЫЙ ВЫВОД: один job в состоянии RUNNING.
+
+# ОЖИДАЕМЫЙ ВЫВОД ИСТОРИИ: при старте Flink читает топик с earliest-offset, поэтому
+# все исторические заказы из лабы 3.2 (5–8 штук) попадут в ПЕРВОЕ 30-секундное окно.
+# Через ~30 секунд в топике revenue_30s появится по одной строке на категорию
+# (Budget/Standard/Premium) с суммарной выручкой и количеством заказов.
+
+# 4.3. Статистика по клиентам (текущее состояние, без окна)
+# -----------------------------------------------------------------
+# ЧТО ДЕЛАЕМ: обычная (не оконная) группировка по customer_name.
+# ЗАЧЕМ: показать, что Flink умеет и «материализованное» состояние — накопительный
+#   счётчик заказов и потраченной суммы на каждого клиента, обновляемый в реальном времени.
+# ПОЧЕМУ ТАК: GROUP BY без окна на append-потоке даёт поток с обновлениями (changelog):
+#   при каждом новом заказе счётчик клиента растёт.
+# -----------------------------------------------------------------
+
+CREATE TEMPORARY VIEW client_stats AS
+SELECT
+  customer_name,
+  COUNT(*)         AS orders_count,
+  SUM(total_price) AS spent_total
+FROM orders_enriched
+GROUP BY customer_name;
+
+# ============================================
+# 5. ИНТЕРАКТИВНЫЕ ЗАПРОСЫ (что смотреть вживую)
+# ============================================
+
+# 5.1. Непрерывный запрос по обогащённому потоку (как push-query в ksqlDB)
+#   SET 'sql-client.execution.result-mode' = 'TABLEAU';
+#   SELECT order_number, customer_name, category, total_price FROM orders_enriched;
+# ОЖИДАЕМЫЙ ВЫВОД: строки появляются по мере поступления новых заказов. Остановить: Ctrl+C.
+
+# 5.2. Текущее состояние по клиентам (обновляемая таблица)
+#   SET 'sql-client.execution.result-mode' = 'TABLEAU';
+#   SELECT * FROM client_stats;
+# ОЖИДАЕМЫЙ ВЫВОД: список клиентов с orders_count и spent_total; при новых заказах
+#   значения обновляются. Остановить: Ctrl+C.
+
+# 5.3. Прочитать результат окон из Kafka (в отдельном терминале, вне SQL Client)
+#   /opt/kafka/bin/kafka-console-consumer.sh \
+#     --topic revenue_30s --from-beginning --bootstrap-server localhost:9092
+# ОЖИДАЕМЫЙ ВЫВОД: JSON-строки вида
+#   {"window_start":"...","window_end":"...","category":"Standard","total_revenue":...,"order_count":...}
+
+# ============================================
+# 6. SINK В OPENSEARCH (через Connect из лабы 3.2)
+# ============================================
+
+# ЧТО ДЕЛАЕМ: создаём в УЖЕ РАБОТАЮЩЕМ Kafka Connect (лаб. 3.2) второй sink-коннектор,
+#   который читает топик revenue_30s и пишет документы в индекс revenue_30s в OpenSearch.
+# ЗАЧЕМ: довести оконные агрегаты до поисковика, где их можно искать/строить графики.
+# ПОЧЕМУ ТАК: переиспользуем тот же Aiven OpensearchSinkConnector из лабы 3.2 (он уже
+#   лежит в /opt/kafka/connect-plugins) — отдельный Flink↔OpenSearch коннектор не нужен.
+#   key.ignore=true: у оконных строк нет осмысленного ключа, _id генерируется сам.
+#   Тот же паттерн, что в лабе 3.2, только топик другой.
+
+# Выполняем в обычном терминале (вне SQL Client):
+cat > /tmp/flink-revenue-sink.json << 'EOF'
+{
+  "name": "flink-revenue-sink",
+  "config": {
+    "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
+    "connection.url": "http://10.0.2.30:9200",
+    "connection.username": "",
+    "connection.password": "",
+    "topics": "revenue_30s",
+    "type": "_doc",
+    "key.ignore": "true",
+    "schema.ignore": "true",
+    "behavior.on.null.values": "ignore",
+    "behavior.on.malformed.documents": "warn",
+    "drop.invalid.message": "true",
+    "tasks.max": "1",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
+EOF
+
+curl -X POST -H "Content-Type: application/json" \
+  --data @/tmp/flink-revenue-sink.json \
+  http://localhost:8083/connectors
+
+# Проверяем статус коннектора
+curl -s http://localhost:8083/connectors/flink-revenue-sink/status | jq .state
+# ОЖИДАЕМЫЙ ВЫВОД: "RUNNING"
+
+# ============================================
+# 7. END-TO-END ДЕМОНСТРАЦИЯ
+# ============================================
+
+# 7.1. Вставляем новый заказ в PostgreSQL (10.0.2.31, БД labdb; пароль labpassword —
+#      только для учебного контура). Возьмите НОВЫЙ order_number (колонка UNIQUE):
+#      при повторном прохождении замените ORD-FLINK-1 на другое значение.
+PGPASSWORD=labpassword psql -h 10.0.2.31 -U labuser -d labdb -c \
+  "INSERT INTO orders (order_number, customer_name, product, quantity, price) VALUES \
+   ('ORD-FLINK-1', 'Студент Flink', 'Курс по Flink SQL', 1, 120000.00);"
+
+# 7.2. Убеждаемся, что CDC-событие дошло до Kafka (Debezium из лабы 3.2)
+#      (детерминированная проверка: опрашиваем топик, пока не найдём наш заказ)
+FOUND=0
+for attempt in $(seq 1 15); do
+  FOUND=$(/opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 \
+    --topic postgres-server.public.orders \
+    --from-beginning \
+    --max-messages 1000 \
+    --timeout-ms 3000 2>/dev/null | grep -c ORD-FLINK-1)
+  [ "$FOUND" -gt 0 ] && break
+  echo "Попытка $attempt: события с ORD-FLINK-1 ещё нет, ждём 2 с..."
+  sleep 2
+done
+[ "$FOUND" -gt 0 ] && echo "✅ CDC-событие найдено" || echo "❌ проверьте коннектор из 3.2"
+
+# 7.3. Ждём закрытия 30-секундного окна и проверяем результат:
+#      (а) в топике revenue_30s появилась строка с категорией 'Premium' (цена 120000 > 100000)
+#      (б) в OpenSearch создан индекс revenue_30s
+sleep 40
+
+echo "=== (а) Топик revenue_30s (последние строки) ==="
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic revenue_30s --from-beginning --max-messages 20 \
+  --timeout-ms 5000 --bootstrap-server localhost:9092
+
+echo "=== (б) Индекс revenue_30s в OpenSearch ==="
+curl -s "http://10.0.2.30:9200/revenue_30s/_count?pretty"
+curl -s "http://10.0.2.30:9200/revenue_30s/_search?q=category:Premium&pretty"
+
+# ОЖИДАЕМЫЙ ВЫВОД:
+#   - в топике revenue_30s: JSON со строками категорий (Premium появится после окна с нашим заказом);
+#   - count в индексе > 0, а поиск по category:Premium находит документ с order_count ≥ 1.
+
+# ============================================
+# 8. ОЧИСТКА (ОПЦИОНАЛЬНО)
+# ============================================
+# ВНИМАНИЕ: коннекторы/топик лабы 3.2 (postgres-source-connector, opensearch-sink-connector,
+# топик postgres-server.public.orders) НЕ удаляем — они нужны для повторного прохождения.
+
+# 1. В SQL Client останавливаем job и выходим:
+#    Flink SQL> STOP JOB '<job_id>';   (job_id смотрим через SHOW JOBS;)
+#    Flink SQL> QUIT;
+#    (если не нашли job_id — просто QUIT: embedded-кластер гасится вместе с клиентом)
+
+# 2. Удаляем sink-коннектор этой лабы (внешний Connect из 3.2):
+#    curl -X DELETE http://localhost:8083/connectors/flink-revenue-sink
+
+# 3. Удаляем топик результата и индекс:
+#    /opt/kafka/bin/kafka-topics.sh --delete --topic revenue_30s --bootstrap-server localhost:9092
+#    curl -X DELETE "http://10.0.2.30:9200/revenue_30s"
+
+# 4. Гигиена: конфиг содержит пароль БД — удаляем из /tmp
+#    rm -f /tmp/flink-revenue-sink.json
+
+# ============================================
+# РЕЗЮМЕ
+# ============================================
+# Название: Потоковая обработка CDC-потока на Apache Flink SQL.
+#
+# Что было изучено:
+#   - Установка Flink и запуск SQL Client в embedded-режиме (без отдельного кластера).
+#   - Чтение Debezium CDC-envelope из Kafka (формат json, разбор ROW<...> полей before/after).
+#   - Обогащение потока (вычисляемые поля, CASE) и фильтрация DELETE-событий.
+#   - Оконная агрегация (TUMBLE 30 сек) по processing-time.
+#   - Запись результата в Kafka и доставка в OpenSearch через Kafka Connect.
+#
+# Ключевые концепции для запоминания:
+#   1. Flink = движок потоковой обработки; источник и приёмник — Kafka (единая шина).
+#   2. processing-time окно закрывается по часам машины; event-time — по времени события
+#      (для event-time нужен watermark по ts_ms; в учебной демо обработка проще и надёжнее).
+#   3. Append-only чтение CDC-envelope: мы сами разбираем after/before. Альтернатива —
+#      формат 'debezium-json' (дает INSERT/UPDATE/DELETE-семантику), но требует
+#      REPLICA IDENTITY FULL у таблицы orders (в лабе 3.2 не задан).
+#   4. DELETE (op='d') даёт after=null → отбрасывается WHERE after IS NOT NULL.
+#      Debezium после DELETE может писать tombstone (value=null) — Flink такие записи
+#      в нашем конвейере не обрабатывает (они не влияют на INSERT-демо).
+
+# Вопросы для самопроверки
+# 1. Почему price в схеме объявлен DOUBLE, а не DECIMAL? Что было бы без
+#    decimal.handling.mode=double в лабе 3.2?
+# 2. Зачем в orders_enriched нужен PROCTIME()? Чем event-time (ts_ms) отличается
+#    от processing-time и что понадобится для перехода на event-time?
+# 3. Почему результат пишется в Kafka, а не напрямую в OpenSearch? Какие плюсы у
+#    «Flink → Kafka → Connect → OpenSearch»?
+# 4. Что произойдёт с оконным счётчиком, если вставить ДВА заказа в одном 30-сек окне?
+#    А если заказы в разных окнах?
+# 5. Почему в шаге 3.1 использован формат 'json' (append-only), а не 'debezium-json'?
+#    Какое условие нужно выполнить, чтобы перейти на 'debezium-json'?
+
+# Дополнительное задание (по желанию)
+# 1. Переключите окно на event-time: добавьте WATERMARK по ts_ms и замените DESCRIPTOR(ptime)
+#    на rowtime-атрибут. Как изменится поведение для исторических данных из лабы 3.2?
+# 2. Добавьте второй агрегат — «количество заказов по продуктам» (GROUP BY product) и
+#    выведите его в отдельный топик.
+# 3. Подключите Grafana (лаб. 3.3) к индексу revenue_30s и постройте график выручки по категориям.
